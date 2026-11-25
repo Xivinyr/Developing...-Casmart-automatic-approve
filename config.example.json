@@ -1,0 +1,11 @@
+{
+  "sheet": null,
+  "header_row": 1,
+  "start_row": 2,
+  "end_row": null,
+  "product_column": null,
+  "record_column": null,
+  "columns": {"T": "订单截图", "U": "支付记录", "V": "发票", "W": "开箱实物图"},
+  "headers": {},
+  "required": ["订单截图", "支付记录", "发票", "开箱实物图"]
+}

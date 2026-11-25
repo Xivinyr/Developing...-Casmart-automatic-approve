@@ -1,0 +1,6 @@
+{
+  "name": "casmart-attachments-browser",
+  "private": true,
+  "scripts": {"browser": "node browser/authorized.mjs", "smoke": "node browser/smoke.cjs"},
+  "devDependencies": {"playwright": "1.62.1"}
+}
