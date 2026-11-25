@@ -60,6 +60,6 @@ python -m attachments.openapi FILE_ID SHEET_ID T2:W100
 
 Excel 现代 `vm` rich-value 单元格图片仅检测并警告，尚未实现 metadata/richData 关系链；absoluteAnchor 无单元格坐标时也警告，不猜位置。OLE 附件、公式 HYPERLINK、非标准私有图片索引暂不支持。合成测试不代表完整 Excel 文件兼容性，也不代表腾讯导出真实性；低层夹具专为 XML 方言回归构造。
 
-源码仓库公开。真实表格、附件、manifest、快照、浏览器配置、凭证与下载均须留在已忽略目录。未触碰旧 `.feishu-edge-profile`，未清理 Git 历史，未推送。
+源码仓库公开。真实表格、附件、manifest、快照、浏览器配置、凭证与下载均须留在已忽略目录。未触碰旧 `.feishu-edge-profile`，未清理 Git 历史。用户于 2026-11-25 明确要求：每次提交后推送到 GitHub；原 MVP 功能分支已同步。
 
 验证证据与方案比较见 [EXPERIMENTS.md](EXPERIMENTS.md)。
