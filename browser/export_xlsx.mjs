@@ -1,6 +1,32 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+
+const maxPdfBytes = 30 * 1024 * 1024;
+
+export async function saveInvoiceDownload(download, directory) {
+  const name = download.suggestedFilename();
+  // 发票使用原文件名匹配，拒绝路径、保留名和异常内容。
+  if (!/\.pdf$/i.test(name) || name.length <= 4 || name !== name.trim()
+      || /[<>:"/\\|?*\x00-\x1f]/.test(name)
+      || /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])\s*\./i.test(name)) {
+    return 'invalid';
+  }
+  const source = await download.path();
+  if ((await stat(source)).size > maxPdfBytes) return 'invalid';
+  const bytes = await readFile(source);
+  if (bytes.length > maxPdfBytes || !bytes.subarray(0, 5).equals(Buffer.from('%PDF-'))) return 'invalid';
+  await mkdir(directory, { recursive: true });
+  const destination = path.join(directory, name);
+  try {
+    await writeFile(destination, bytes, { flag: 'wx' });
+    return 'saved';
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    return bytes.equals(await readFile(destination)) ? 'already_saved' : 'name_conflict';
+  }
+}
 
 export function runAttachments(python, args) {
   return new Promise((resolve, reject) => {

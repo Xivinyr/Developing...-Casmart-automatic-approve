@@ -1,12 +1,15 @@
 """统一单元格模型、记录隔离和分类保存（仅使用标准库）。"""
 from __future__ import annotations
 
+from collections import Counter
 import hashlib
 import json
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .invoices import index_invoices, invoice_key, read_invoice
 
 
 @dataclass
@@ -87,12 +90,31 @@ DEFAULT = dict(header_row=1, start_row=2, end_row=None, product_column=None,
                headers={}, required=['订单截图','支付记录','发票','开箱实物图'])
 
 
-def classify(sheets, output, config=None, fetch=None):
+def _save_file(data, label, root, folder, record, seen):
+    ext = extension(data)
+    digest = hashlib.sha256(data).hexdigest()
+    # 类型内去重，跨类型/跨订单保留业务归属。
+    identity = label, digest
+    if identity in seen:
+        return False
+    folder.mkdir(parents=True, exist_ok=True)
+    filename = f'{safe(label)}-{len(record["files"])+1:03d}-{digest[:12]}{ext}'
+    dest = folder / filename
+    with dest.open('xb') as stream:
+        stream.write(data)
+    seen.add(identity)
+    record['files'].append({'category':label, 'path':str(dest.relative_to(root)), 'sha256':digest, 'bytes':len(data)})
+    return True
+
+
+def classify(sheets, output, config=None, fetch=None, invoice_dir=None):
     config = DEFAULT | (config or {})
     # 每次独立目录 + 排他创建文件，任何重跑均不覆盖上次结果。
     root = Path(output) / ('run-' + time.strftime('%Y%m%d-%H%M%S') + '-' + __import__('uuid').uuid4().hex[:8])
     root.mkdir(parents=True, exist_ok=False)
     report = {'records': [], 'errors': [], 'warnings': [], 'saved': 0, 'duplicates': 0}
+    invoice_references = Counter()
+    invoice_candidates = []
     for si, sheet in enumerate(sheets, 1):
         report['warnings'].extend(sheet.warnings)
         cols = {column(k):v for k,v in config['columns'].items()}
@@ -122,35 +144,87 @@ def classify(sheets, output, config=None, fetch=None):
         for origin, rows in groups.items():
             name = sheet.cell(rows[0],pc).text if pc else product(sheet.cell(rows[0],invoice).text if invoice else '')
             folder = root / f'{si:02d}-{safe(sheet.name)}' / f'row-{origin:06d}-{safe(name)}'
-            seen = {}
+            seen = set()
             found = set()
-            rec = {'sheet_index':si, 'row':origin, 'rows':rows, 'product':name, 'files':[], 'missing':[]}
+            explicit_sources = set()
+            invoice_names = {}
+            rec = {'sheet_index':si, 'row':origin, 'rows':rows, 'product':name, 'files':[]}
             for row in rows:
                 for col, label in cols.items():
                     if (row,col) in ambiguous: continue
-                    for asset in sheet.cell(row,col).assets:
+                    cell = sheet.cell(row,col)
+                    if cell.assets:
+                        explicit_sources.add(label)
+                    if label == '发票':
+                        key = invoice_key(cell.text)
+                        if key is not None:
+                            invoice_names.setdefault(key, (row,col))
+                    for asset in cell.assets:
                         try:
                             data = asset.data if asset.data is not None else (fetch(asset.source) if fetch else None)
                             if data is None: raise ValueError('online_fetch_required')
-                            ext = extension(data)
-                            digest = hashlib.sha256(data).hexdigest()
-                            found.add(label)
-                            # 类型内去重，跨类型/跨订单保留业务归属。
-                            if (label,digest) in seen:
+                            if _save_file(data, label, root, folder, rec, seen):
+                                report['saved'] += 1
+                            else:
                                 report['duplicates'] += 1
-                                continue
-                            folder.mkdir(parents=True, exist_ok=True)
-                            filename = f'{safe(label)}-{len(rec["files"])+1:03d}-{digest[:12]}{ext}'
-                            with (folder / filename).open('xb') as f: f.write(data)
-                            seen[label,digest] = filename
-                            rec['files'].append({'category':label,'path':str((folder/filename).relative_to(root)), 'sha256':digest,'bytes':len(data)})
-                            report['saved'] += 1
+                            found.add(label)
                         except Exception as exc:
                             # 不记录 URL、查询参数、响应正文或异常全文，避免泄露临时签名/令牌。
                             code = str(exc) if str(exc) in ('online_fetch_required','unsupported_content') else type(exc).__name__
                             report['errors'].append({'sheet_index':si,'row':row,'column':col,'code':code})
             rec['missing'] = [v for v in config['required'] if v not in found]
+            rec['missing_reasons'] = {
+                label: 'resource_unavailable' if label in explicit_sources else 'no_source'
+                for label in rec['missing']
+            }
+            # 先收集各工作表的引用，再匹配本地文件，避免相同文件名误归入多笔记录。
+            invoice_references.update(invoice_names.keys())
+            if invoice_names and '发票' not in found and '发票' not in explicit_sources:
+                if '发票' in rec['missing_reasons']:
+                    rec['missing_reasons']['发票'] = 'invoice_filename_only'
+                if invoice_dir is not None:
+                    invoice_candidates.append((invoice_names, folder, rec))
             report['records'].append(rec)
+    if invoice_candidates:
+        _backfill_invoices(invoice_dir, invoice_references, invoice_candidates, root, report)
     (root/'manifest.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     (root/'errors.jsonl').write_text(''.join(json.dumps(e, ensure_ascii=False)+'\n' for e in report['errors']), encoding='utf-8')
     return root, report
+
+
+def _backfill_invoices(directory, references, candidates, root, report):
+    try:
+        local_files = index_invoices(directory)
+    except OSError:
+        local_files = None
+
+    for names, folder, record in candidates:
+        key, (row, col) = next(iter(names.items()))
+        if len(names) != 1 or references[key] != 1:
+            reason = 'invoice_filename_ambiguous'
+        elif local_files is None:
+            reason = 'invoice_folder_unavailable'
+        else:
+            matches = local_files.get(key, [])
+            if len(matches) > 1:
+                reason = 'invoice_filename_ambiguous'
+            elif not matches:
+                reason = 'invoice_not_in_folder'
+            else:
+                try:
+                    data = read_invoice(matches[0])
+                except (OSError, ValueError):
+                    reason = 'invoice_local_invalid'
+                else:
+                    try:
+                        _save_file(data, '发票', root, folder, record, set())
+                    except OSError as exc:
+                        reason = 'resource_unavailable'
+                        report['errors'].append({'sheet_index':record['sheet_index'], 'row':row, 'column':col, 'code':type(exc).__name__})
+                    else:
+                        report['saved'] += 1
+                        record['missing'] = [label for label in record['missing'] if label != '发票']
+                        record['missing_reasons'].pop('发票', None)
+                        continue
+        if '发票' in record['missing_reasons']:
+            record['missing_reasons']['发票'] = reason
