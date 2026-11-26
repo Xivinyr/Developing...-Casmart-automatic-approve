@@ -91,7 +91,7 @@ class TaskMenu:
 
         attachments = ttk.LabelFrame(body, text="腾讯文档附件", padding=(12, 6))
         attachments.grid(sticky="ew", pady=(10, 0))
-        self.add_task(attachments, ONLINE_TASK, "在网页选中当月 T 到 W 列数据并复制，回到任务窗口输入 c。", self.online_sheet)
+        self.add_task(attachments, ONLINE_TASK, "打开当月工作表，在任务窗口输入 a 自动选区、复制和分类。", self.online_sheet)
         self.add_task(attachments, "本地 XLSX 附件分类", "选择已导出的 XLSX，提取并分类其中的附件。", self.local_xlsx)
 
         footer = ttk.Frame(body)
@@ -177,7 +177,7 @@ class TaskMenu:
     def start(self, args, label, *, console=False, attachment=False, env=None):
         if self.process is not None:
             return
-        # 联网模式需要保留可输入 c/q 的终端；离线分类在后台执行。
+        # 联网模式需要保留可输入 a/c/p/q 的终端；离线分类在后台执行。
         flags = getattr(subprocess, "CREATE_NEW_CONSOLE" if console else "CREATE_NO_WINDOW", 0)
         streams = {} if console else {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
         try:

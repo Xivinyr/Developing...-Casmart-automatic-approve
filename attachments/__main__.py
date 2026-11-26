@@ -5,13 +5,17 @@ import json
 from pathlib import Path
 from .core import Asset, Cell, Sheet, classify, column, invoice_link_cells
 from .xlsx import read_xlsx
-from .clipboard import ClipboardInputError, read_html, read_windows_html
+from .clipboard import ClipboardInputError, clipboard_sequence, read_html, read_windows_html
 
 
 CLIPBOARD_MESSAGES = {
     'clipboard_busy': '剪贴板暂时被占用，请回到表格重新复制后再试。',
     'clipboard_has_no_html': '剪贴板没有表格格式。请在腾讯表格中选中单元格并按 Ctrl+C，再回到任务窗口。',
     'clipboard_lock_failed': '无法读取剪贴板，请重新复制选区。',
+    'clipboard_sequence_unavailable': '无法确认剪贴板更新，请在网页手动复制选区后输入 c。',
+    'clipboard_not_updated': '没有收到本次自动复制的新内容，请在网页手动复制选区后输入 c。',
+    'clipboard_range_mismatch': '收到的表格范围与自动选区不一致，请在网页手动复制选区后输入 c。',
+    'clipboard_empty_selection': '自动复制的范围没有检测到文字或附件。',
     'invalid_cf_html': '读到的剪贴板表格片段不完整，请重新复制选区或导出 XLSX。',
     'clipboard_no_table': '复制内容没有可读取的表格单元格，请重新选中 T 到 W 列的数据行或导出 XLSX。',
     'clipboard_invalid_span': '复制内容含无法识别的合并单元格，请缩小选区或导出 XLSX。',
@@ -90,25 +94,48 @@ def from_snapshot(data):
 
 def main():
     p = argparse.ArgumentParser(description='报账附件提取；不操作送审')
-    p.add_argument('mode', choices=['xlsx','html','clipboard','snapshot'])
+    p.add_argument('mode', choices=['xlsx','html','clipboard','clipboard-sequence','snapshot'])
     p.add_argument('input', nargs='?')
     p.add_argument('--config')
     p.add_argument('--output', default='outputs')
     p.add_argument('--start-row', type=int, default=2)
     p.add_argument('--start-col', default='T')
+    p.add_argument('--after-sequence', type=int)
+    p.add_argument('--expected-end-row', type=int)
+    p.add_argument('--expected-end-col')
+    p.add_argument('--trim-trailing-empty', action='store_true')
     p.add_argument('--invoice-dir', help='已下载发票 PDF 所在文件夹，按表格中的唯一同名文件归类')
     p.add_argument('--human', action='store_true', help='显示便于阅读的结果和缺项说明')
     p.add_argument('--prepare', help='仅输出本地中间模型，供已登录浏览器 Fetch 使用')
     p.add_argument('--invoice-links', action='store_true', help='标记配置的发票列中可供在线处理的来源')
     args = p.parse_args()
+    automatic_fields = (args.after_sequence, args.expected_end_row, args.expected_end_col)
+    expected_end = None
+    if args.trim_trailing_empty or any(value is not None for value in automatic_fields):
+        if (args.mode != 'clipboard' or not args.trim_trailing_empty
+                or any(value is None for value in automatic_fields)):
+            p.error('自动复制校验参数必须在 clipboard 模式同时使用')
+        if not 1 <= args.after_sequence <= 0xffffffff:
+            p.error('剪贴板更新编号无效')
+        try:
+            expected_end = (args.expected_end_row, column(args.expected_end_col))
+        except ValueError:
+            p.error('自动选区的结束列无效')
     if args.invoice_links and (args.mode not in ('xlsx', 'clipboard') or not args.prepare):
         p.error('--invoice-links 仅用于带 --prepare 的 xlsx 或 clipboard')
+    if args.mode == 'clipboard-sequence':
+        print(clipboard_sequence())
+        return 0
     config = json.loads(Path(args.config).read_text(encoding='utf-8-sig')) if args.config else {}
     if args.mode == 'xlsx': sheets = read_xlsx(args.input, config.get('sheet'))
     elif args.mode == 'snapshot': sheets = from_snapshot(json.loads(Path(args.input).read_text(encoding='utf-8')))
     else:
-        raw = read_windows_html() if args.mode == 'clipboard' else Path(args.input).read_bytes()
-        sheets = read_html(raw, args.start_row, column(args.start_col))
+        if args.mode == 'clipboard':
+            raw = read_windows_html() if args.after_sequence is None else read_windows_html(args.after_sequence)
+        else:
+            raw = Path(args.input).read_bytes()
+        sheets = read_html(raw, args.start_row, column(args.start_col),
+                           expected_end=expected_end, trim_trailing_empty=args.trim_trailing_empty)
     if args.prepare:
         dest = Path(args.prepare)
         dest.parent.mkdir(parents=True,exist_ok=True)

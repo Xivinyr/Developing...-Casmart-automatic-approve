@@ -1,6 +1,7 @@
 """使用合成表格与模拟读取，不接触 Windows 的真实剪贴板。"""
+import ctypes
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from attachments import clipboard
 from attachments.clipboard import ClipboardInputError, read_html, read_windows_html
@@ -26,6 +27,54 @@ class ClipboardDiagnosticsTests(unittest.TestCase):
                 read_windows_html()
         self.assertEqual(raised.exception.code, 'clipboard_has_no_html')
         self.assertEqual(read.call_count, 8)
+
+    def test_automatic_copy_waits_for_a_different_sequence(self):
+        with patch.object(clipboard, '_read_windows_html_once', side_effect=[
+            ClipboardInputError('clipboard_not_updated'),
+            TABLE,
+        ]) as read, patch.object(clipboard.time, 'sleep'):
+            self.assertEqual(read_windows_html(after_sequence=42), TABLE)
+        self.assertEqual(read.call_args_list, [call(42), call(42)])
+
+    def test_stale_clipboard_is_not_read(self):
+        api = Mock()
+        with patch.object(ctypes, 'windll', api, create=True), patch.object(clipboard.os, 'name', 'nt'), \
+             patch.object(clipboard, 'clipboard_sequence', return_value=42), \
+             self.assertRaises(ClipboardInputError) as raised:
+            clipboard._read_windows_html_once(after_sequence=42)
+        self.assertEqual(raised.exception.code, 'clipboard_not_updated')
+        api.user32.GetClipboardData.assert_not_called()
+        api.user32.CloseClipboard.assert_called_once()
+
+    def test_automatic_copy_rejects_geometry_mismatch(self):
+        four_cells = b'<td></td>' * 4
+        for raw in (
+            b'<table><tr>' + four_cells + b'</tr><tr><td>too narrow</td></tr></table>',
+            b'<table><tr>' + four_cells + b'</tr></table>',
+            b'<table><tr>' + four_cells + b'<td>extra</td></tr><tr>' + four_cells + b'</tr></table>',
+            b'<table><tr><td rowspan="3">outside</td>' + b'<td></td>' * 3 + b'</tr></table>',
+        ):
+            with self.subTest(raw=raw), self.assertRaises(ClipboardInputError) as raised:
+                read_html(raw, expected_end=(3, 23), trim_trailing_empty=True)
+            self.assertEqual(raised.exception.code, 'clipboard_range_mismatch')
+
+    def test_trim_preserves_internal_blank_rows_and_image_only_data(self):
+        raw = (
+            b'<table><tr><td rowspan="4">record</td><td></td><td></td><td></td></tr>'
+            b'<tr><td>&nbsp;</td><td> </td><td></td></tr>'
+            b'<tr><td></td><td></td><td><img src="data:image/png;base64,eA=="></td></tr>'
+            b'<tr><td></td><td> </td><td></td></tr></table>'
+        )
+        sheet, = read_html(raw, expected_end=(5, 23), trim_trailing_empty=True)
+        self.assertEqual({row for row, col in sheet.cells}, {2, 3, 4})
+        self.assertEqual(sheet.merges, [(2, 20, 4, 20)])
+        self.assertTrue(sheet.cells[(4, 23)].assets)
+
+    def test_automatic_copy_with_only_whitespace_has_no_records(self):
+        raw = b'<table><tr><td>&nbsp;</td><td></td><td> </td><td></td></tr></table>'
+        with self.assertRaises(ClipboardInputError) as raised:
+            read_html(raw, expected_end=(2, 23), trim_trailing_empty=True)
+        self.assertEqual(raised.exception.code, 'clipboard_empty_selection')
 
     def test_invalid_offsets_use_explicit_fragment_without_surrounding_tables(self):
         raw = (

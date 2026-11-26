@@ -1,5 +1,7 @@
 // 浏览器使用单独的附件任务配置；手动登录、导出和复制选区。
 import { createRequire } from 'node:module';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -7,6 +9,7 @@ import { createInterface } from 'node:readline/promises';
 import { processExport, runAttachments, saveInvoiceDownload } from './export_xlsx.mjs';
 import { hydrateVisibleSelectionInvoices } from './selection_invoices.mjs';
 import { downloadVisibleSelectionInvoices } from './selection_download.mjs';
+import { copyCurrentSheetRange } from './auto_selection.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 const launchArgs = process.argv.slice(2);
@@ -41,6 +44,17 @@ const downloads = new Set();
 const closing = new AbortController();
 const invoiceDir = path.join(local, 'invoice-downloads', crypto.randomUUID());
 const configArgs = config ? ['--config', config] : [];
+const maxAutoRows = 1000;
+const execFileAsync = promisify(execFile);
+const autoSelectionHints = {
+  sheet_unavailable: '请先在附件浏览器中打开当月工作表并确认已加载。',
+  sheet_changed: '选区期间工作表发生变化，请回到目标工作表后重试。',
+  name_box_unavailable: '当前网页没有可确认的单元格地址框。',
+  last_row_unverified: '无法确认工作表末行。若已知行号，可输入 a 加行号，例如 a 35。',
+  range_too_large: '自动选区超出 1000 行限制。',
+  range_unverified: '网页没有确认选中了预期范围。',
+  clipboard_guard_failed: '无法确认剪贴板可以接收本次复制。',
+};
 let pendingInvoices = Promise.resolve();
 let invoiceConflict = false;
 let lastCapture = null;
@@ -51,6 +65,16 @@ context.on('close', () => closing.abort());
 rl.on('close', () => closing.abort());
 context.on('page', bind);
 bind(page);
+
+async function clipboardSequence() {
+  const { stdout } = await execFileAsync(
+    python, ['-m', 'attachments', 'clipboard-sequence'], { encoding: 'utf8', timeout: 5000, windowsHide: true },
+  );
+  const sequence = stdout.trim();
+  if (!/^[1-9][0-9]{0,9}$/.test(sequence)) throw Error('clipboard_sequence_unavailable');
+  return sequence;
+}
+
 function bind(p) {
   p.on('download', d => {
     if (/\.pdf$/i.test(d.suggestedFilename())) {
@@ -89,17 +113,20 @@ function bind(p) {
 try {
   await page.goto(sheetUrl.href, { waitUntil: 'domcontentloaded' });
   if (selectionOnly) {
-    console.log('请在网页打开要报账的工作表，选中本次的 T 到 W 列数据行并按 Ctrl+C。');
+    console.log('请在网页打开要报账的工作表。输入 a 自动选择并复制 T 到 W 列；手动复制的选区可用 c。');
   } else {
     console.log('请在浏览器登录并完成验证。导出 XLSX 后会自动分类，并尝试下载表格保留的发票链接。');
   }
   while (!closing.signal.aborted) {
-    const command = (await rl.question('复制表格选区后输入 c；下载发票后输入 p；退出输入 q：', { signal: closing.signal })).trim();
+    const prompt = selectionOnly
+      ? '自动选区 a；从已复制选区处理 c；补齐发票 p；退出 q：'
+      : '复制表格选区后输入 c；下载发票后输入 p；退出输入 q：';
+    const command = (await rl.question(prompt, { signal: closing.signal })).trim();
     if (command === 'q') break;
     if (command === 'p') {
       const capture = lastCapture || lastExport;
       if (!capture) {
-        console.log('请先复制表格数据行后输入 c。程序需要选区中的发票文件名匹配。');
+        console.log('请先处理表格选区。程序需要选区中的发票文件名来匹配 PDF。');
         continue;
       }
       const input = (await rl.question('直接回车使用本任务下载的 PDF，或粘贴 PDF 所在文件夹路径：', { signal: closing.signal })).trim();
@@ -115,16 +142,52 @@ try {
       else exportNeedsReview = code !== 0;
       continue;
     }
-    if (command !== 'c') continue;
+    const autoCommand = selectionOnly && /^a(?:\s+([1-9][0-9]{0,6}))?$/.exec(command);
+    if (command !== 'c' && !autoCommand) continue;
     lastCapture = null;
     const prepared = path.join(local,'prepared.json');
     const selectionArgs = selectionOnly ? [...configArgs, '--invoice-links'] : [];
-    const preparedCode = await runAttachments(python, ['clipboard','--start-row',String(settings.start_row || 2),'--start-col',startCol,'--prepare',prepared,'--human', ...selectionArgs]);
+    const startRow = settings.start_row ?? 2;
+    let autoRange;
+    const copyArgs = [];
+    if (autoCommand) {
+      try {
+        const endRow = autoCommand[1] ? Number(autoCommand[1]) : settings.end_row ?? undefined;
+        if (startCol !== 'T' || (settings.end_row != null && endRow > settings.end_row)) {
+          throw Error('unsupported_auto_range');
+        }
+        console.log('正在确认当前工作表的 T 到 W 列范围。');
+        autoRange = await copyCurrentSheetRange(page, {
+          startRow, endRow, startCol, endCol: 'W', maxRows: maxAutoRows, beforeCopy: clipboardSequence,
+        });
+        if (!autoRange.sequence) throw Error('clipboard_sequence_unavailable');
+        console.log(`已在当前工作表选中并复制 ${autoRange.range}，正在核对剪贴板。`);
+        copyArgs.push('--after-sequence', autoRange.sequence,
+          '--expected-end-row', String(autoRange.endRow), '--expected-end-col', 'W', '--trim-trailing-empty');
+      } catch (error) {
+        clipboardNeedsReview = true;
+        const hint = autoSelectionHints[error.code];
+        if (hint) console.log(hint);
+        console.log('已停止本次自动处理。可手动复制 T 到 W 列后输入 c。');
+        continue;
+      }
+    }
+    const preparedCode = await runAttachments(python, ['clipboard', '--start-row', String(startRow),
+      '--start-col', startCol, '--prepare', prepared, '--human', ...selectionArgs, ...copyArgs]);
     if (preparedCode !== 0) {
       clipboardNeedsReview = true;
       continue;
     }
     const sheets = JSON.parse(await readFile(prepared,'utf8'));
+    if (autoRange) {
+      const lastRow = sheets.flatMap(sheet => sheet.cells).reduce((last, cell) => Math.max(last, cell.row), 0);
+      if (lastRow < startRow) {
+        clipboardNeedsReview = true;
+        console.log('本次选区没有可处理的非空行。');
+        continue;
+      }
+      console.log(`选区中最后一个非空行是第 ${lastRow} 行，开始分类。`);
+    }
     if (selectionOnly) console.log('已触发自动检查，正在核对本次选区的发票链接和下载控件。');
     let failures = 0;
     for (const s of sheets) for (const c of s.cells) for (const a of c.assets) {
