@@ -1,13 +1,18 @@
+import argparse
 import os
 import sys
 import time
 import tkinter as tk
 from tkinter import messagebox
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from credential_store import delete_credentials, load_credentials, save_credentials
 
 from selenium import webdriver
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
     NoSuchElementException,
+    NoSuchWindowException,
     StaleElementReferenceException,
     TimeoutException,
 )
@@ -27,17 +32,18 @@ EDGE_BINARY_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.ex
 EDGE_DRIVER_PATH = ""
 
 # Casmart 采购管理 -> 线下采购单据列表页。
-TARGET_URL = (
-    "https://member.casmart.com.cn/supplier/offline/bill/list"
-    "?client-key=eadd9901df4bdaed0b2b1d95e0c77534"
-)
+TARGET_PATH = "/supplier/offline/bill/list"
+TARGET_URL = f"https://member.casmart.com.cn{TARGET_PATH}"
+# 只在这些 HTTPS 网站填写各自的凭证；不硬编码截图中的个人账号或回跳参数。
+CASMART_LOGIN_HOSTS = {"member.casmart.com.cn", "www.casmart.com.cn", "institutes.casmart.com.cn"}
+SMU_LOGIN_HOST = "uis.smu.edu.cn"
 
 # 如果需要保持登录态，可以填 Edge 用户数据目录，例如：
 # r"C:\Users\你的用户名\AppData\Local\Microsoft\Edge\User Data"
 EDGE_USER_DATA_DIR = ""
 
 WAIT_TIME = 15
-LOGIN_VERIFY_WAIT_SECONDS = 10
+LOGIN_WAIT_SECONDS = 600  # 留出验证码、微信或其他学校验证的人工操作时间。
 AFTER_SUBMIT_CLICK_SECONDS = 0.3
 AFTER_CONFIRM_CLICK_SECONDS = 3
 MAX_PAGES = 0  # 0 表示不限制页数
@@ -47,29 +53,43 @@ CANCEL_KEYWORDS = ("取消", "关闭", "返回", "暂不")
 # ------------------
 
 
-def ask_credentials():
-    """用 Tkinter 获取 Casmart 登录账号密码。"""
-    result = {"username": "", "password": "", "cancelled": True}
-
+def ask_credentials(login_only=False):
+    """分别填写商城与学校账号；勾选后用当前 Windows 用户加密保存。"""
+    result = {"accounts": None}
     root = tk.Tk()
-    root.title("Casmart 登录")
+    root.title("Casmart / 学校统一认证")
     root.resizable(False, False)
     root.attributes("-topmost", True)
-
-    width, height = 340, 170
+    width, height = 500, 340
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     x = (screen_width - width) // 2
     y = (screen_height - height) // 2
     root.geometry(f"{width}x{height}+{x}+{y}")
 
-    tk.Label(root, text="Casmart 账号：").grid(row=0, column=0, padx=18, pady=(22, 8), sticky="e")
-    username_entry = tk.Entry(root, width=28)
-    username_entry.grid(row=0, column=1, padx=(0, 18), pady=(22, 8))
+    try:
+        saved = load_credentials()
+    except (OSError, ValueError):
+        saved = {}
+        messagebox.showwarning("登录信息", "原保存信息无法读取，可清除后重新保存；也可本次手动填写。", parent=root)
 
-    tk.Label(root, text="Casmart 密码：").grid(row=1, column=0, padx=18, pady=8, sticky="e")
-    password_entry = tk.Entry(root, width=28, show="*")
-    password_entry.grid(row=1, column=1, padx=(0, 18), pady=8)
+    tk.Label(root, text="两处账号分别填写；留空可在浏览器中手动登录。 ").grid(
+        row=0, column=0, columnspan=2, padx=18, pady=(14, 8))
+    entries = {}
+    for row, (service, label) in enumerate((("casmart", "Casmart"), ("smu", "学校统一认证"))):
+        for offset, (field, name) in enumerate((("username", "账号"), ("password", "密码"))):
+            grid_row = 1 + row * 2 + offset
+            tk.Label(root, text=f"{label}{name}：").grid(row=grid_row, column=0, padx=18, pady=7, sticky="e")
+            entry = tk.Entry(root, width=32, show="*" if field == "password" else "")
+            entry.grid(row=grid_row, column=1, padx=(0, 18), pady=7)
+            entry.insert(0, saved.get(service, {}).get(field, ""))
+            entries[service, field] = entry
+
+    remember = tk.BooleanVar(root, value=bool(saved))
+    tk.Checkbutton(root, text="记住账号密码（Windows 当前用户加密）", variable=remember).grid(
+        row=5, column=0, columnspan=2, pady=(6, 2))
+    tk.Label(root, text="验证码 / 微信 / 二次验证仍需在浏览器手动完成。", fg="#666666").grid(
+        row=6, column=0, columnspan=2, pady=4)
 
     def paste_to_entry(entry):
         try:
@@ -84,7 +104,7 @@ def ask_credentials():
         return "break"
 
     context_menu = tk.Menu(root, tearoff=0)
-    active_entry = {"widget": username_entry}
+    active_entry = {"widget": entries["casmart", "username"]}
     context_menu.add_command(label="粘贴", command=lambda: paste_to_entry(active_entry["widget"]))
 
     def show_context_menu(event):
@@ -92,37 +112,64 @@ def ask_credentials():
         event.widget.focus_set()
         context_menu.tk_popup(event.x_root, event.y_root)
 
-    for entry in (username_entry, password_entry):
+    for entry in entries.values():
         entry.bind("<Control-v>", lambda _event, e=entry: paste_to_entry(e))
         entry.bind("<Control-V>", lambda _event, e=entry: paste_to_entry(e))
         entry.bind("<Shift-Insert>", lambda _event, e=entry: paste_to_entry(e))
         entry.bind("<Button-3>", show_context_menu)
 
     def submit():
-        username = username_entry.get().strip()
-        password = password_entry.get()
-        if not username or not password:
-            messagebox.showwarning("提示", "请填写账号和密码。", parent=root)
+        accounts = {}
+        for service in ("casmart", "smu"):
+            username = entries[service, "username"].get().strip()
+            password = entries[service, "password"].get()
+            if bool(username) != bool(password):
+                messagebox.showwarning("提示", "每处账号与密码请同时填写，或同时留空。", parent=root)
+                return
+            if username:
+                accounts[service] = {"username": username, "password": password}
+        try:
+            if remember.get() and accounts:
+                save_credentials(accounts)
+            else:
+                delete_credentials()
+        except (OSError, ValueError):
+            messagebox.showerror("保存失败", "无法更新本机保存信息。请检查目录权限，或清除旧信息后重试。", parent=root)
             return
-        result.update({"username": username, "password": password, "cancelled": False})
+        result["accounts"] = accounts
         root.destroy()
+
+    def clear_saved():
+        try:
+            delete_credentials()
+        except OSError:
+            messagebox.showerror("清除失败", "无法删除本机保存信息，请检查目录权限。", parent=root)
+            return
+        for entry in entries.values():
+            entry.delete(0, tk.END)
+        remember.set(False)
+        messagebox.showinfo("已清除", "本机保存的两处账号密码已删除。", parent=root)
 
     def cancel():
         root.destroy()
 
     button_frame = tk.Frame(root)
-    button_frame.grid(row=2, column=0, columnspan=2, pady=(12, 0))
-    tk.Button(button_frame, text="登录并开始", width=12, command=submit).pack(side="left", padx=8)
+    button_frame.grid(row=7, column=0, columnspan=2, pady=(10, 0))
+    start_label = "仅验证登录" if login_only else "登录并开始"
+    tk.Button(button_frame, text=start_label, width=12, command=submit).pack(side="left", padx=8)
+    tk.Button(button_frame, text="清除保存", width=10, command=clear_saved).pack(side="left", padx=8)
     tk.Button(button_frame, text="取消", width=8, command=cancel).pack(side="left", padx=8)
 
     root.bind("<Return>", lambda _event: submit())
     root.protocol("WM_DELETE_WINDOW", cancel)
-    username_entry.focus_set()
+    # 按系统字体/DPI 扩展窗口，避免新增学校账号与保存按钮被截断。
+    root.update_idletasks()
+    width, height = max(width, root.winfo_reqwidth()), max(height, root.winfo_reqheight())
+    root.geometry(f"{width}x{height}+{(screen_width - width) // 2}+{(screen_height - height) // 2}")
+    entries["casmart", "username"].focus_set()
     root.mainloop()
 
-    if result["cancelled"]:
-        return None
-    return result["username"], result["password"]
+    return result["accounts"]
 
 
 def init_driver():
@@ -381,13 +428,6 @@ def collect_clickable_texts(driver, depth=0, max_depth=3):
     return texts
 
 
-def countdown(seconds):
-    for remaining in range(seconds, 0, -1):
-        print(f"\r等待登录/页面确认：还剩 {remaining:>2} 秒", end="", flush=True)
-        time.sleep(1)
-    print("\r等待登录/页面确认：倒计时结束，开始自动送审。      ")
-
-
 def visible_inputs(driver):
     inputs = driver.find_elements(By.CSS_SELECTOR, "input")
     return [
@@ -406,7 +446,7 @@ def find_login_fields(driver):
         for element in inputs
         if (element.get_attribute("type") or "").lower() == "password"
     ]
-    if not password_inputs:
+    if len(password_inputs) != 1:
         return None, None
 
     password_input = password_inputs[0]
@@ -430,48 +470,17 @@ def find_login_fields(driver):
 
 
 def find_login_button(driver):
-    xpath = (
-        "//button[contains(normalize-space(.), '登录')]"
-        " | //a[contains(normalize-space(.), '登录')]"
-        " | //*[@role='button' and contains(normalize-space(.), '登录')]"
-        " | //div[contains(normalize-space(.), '登录')]"
-        " | //span[contains(normalize-space(.), '登录')]"
-        " | //*[contains(@class, 'login') or contains(@class, 'Login')]"
-        " | //*[contains(@class, 'layui-btn') and contains(normalize-space(.), '登录')]"
-        " | //input[@type='submit' or @type='button']"
-        "[contains(@value, '登录')]"
-    )
-    candidates = find_visible_elements(driver, By.XPATH, xpath)
-    buttons = []
-    seen = set()
-    for candidate in candidates:
-        text = element_text(candidate) or candidate.get_attribute("value") or ""
-        classes = candidate.get_attribute("class") or ""
-        if "登录" not in text and "login" not in classes.lower():
-            continue
+    # 只匹配真正的登录操作，避免点到“账号登录”标签或整个登录面板。
+    return find_login_action(driver, {"登录", "登陆"})
 
-        button = clickable_ancestor(driver, candidate) or candidate
-        if button.is_enabled() and not is_disabled(button):
-            element_id = button.id
-            if element_id not in seen:
-                seen.add(element_id)
-                buttons.append(button)
 
-    def priority(element):
-        tag_name = element.tag_name.lower()
-        classes = element.get_attribute("class") or ""
-        text = element_text(element) or element.get_attribute("value") or ""
-        score = 0
-        if text == "登录":
-            score -= 30
-        if "login" in classes.lower():
-            score -= 20
-        if tag_name in ("button", "a"):
-            score -= 10
-        return score
-
-    buttons.sort(key=priority)
-    return buttons[0] if buttons else None
+def find_login_action(driver, labels):
+    selector = "button,a,[role='button'],input[type='submit'],input[type='button'],[onclick],.login-btn,.layui-layer-btn0"
+    for element in find_visible_elements(driver, By.CSS_SELECTOR, selector):
+        text = element_text(element) or compact_text(element.get_attribute("value"))
+        if text in labels and element.is_enabled() and not is_disabled(element):
+            return element
+    return None
 
 
 def set_input_value(driver, element, value):
@@ -505,54 +514,114 @@ def submit_login(driver, login_button, password_input):
     except Exception:
         pass
 
-    print("尝试提交登录表单。")
+    # 不用 form.submit() 绕过页面的校验或登录事件。
+    return False
+
+
+def login_service(url):
+    """严格核对 HTTPS 来源，账号不自动填写到其他网站。"""
     try:
-        driver.execute_script(
-            """
-            const input = arguments[0];
-            const form = input.closest("form");
-            if (form) {
-                form.dispatchEvent(new Event("submit", {bubbles: true, cancelable: true}));
-                form.submit();
-                return true;
-            }
-            return false;
-            """,
-            password_input,
-        )
-        time.sleep(0.5)
-        return True
-    except Exception:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or parsed.port not in (None, 443) or parsed.username is not None:
+            return None
+        if parsed.hostname == SMU_LOGIN_HOST:
+            return "smu"
+        if parsed.hostname in CASMART_LOGIN_HOSTS:
+            return "casmart"
+    except ValueError:
+        pass
+    return None
+
+
+def is_authenticated_casmart(driver):
+    if login_service(driver.current_url) != "casmart" or urlsplit(driver.current_url).hostname != "member.casmart.com.cn":
         return False
+    if any((element.get_attribute("type") or "").lower() == "password" for element in visible_inputs(driver)):
+        return False
+    # 正向检查会员中心的退出入口；“没有登录框”本身不能证明已登录。
+    logout_xpath = (
+        "//a[contains(normalize-space(.), '退出')] | //button[contains(normalize-space(.), '退出')]"
+        " | //*[@id='logout' or contains(@class, 'logout')]"
+    )
+    return bool(find_visible_elements(driver, By.XPATH, logout_xpath))
 
 
-def auto_login_if_needed(driver, username, password):
-    """如果当前页面出现登录框，就自动输入账号密码并点击登录。"""
-    print("正在检查是否需要登录...")
-    end_time = time.time() + 12
+def select_login_window(driver):
+    """兼容认证在新窗口打开、回跳到原窗口的情况。"""
+    candidate = None
+    handles = driver.window_handles
+    for handle in reversed(handles):
+        try:
+            driver.switch_to.window(handle)
+            driver.switch_to.default_content()
+            if is_authenticated_casmart(driver):
+                return handle, "ready"
+            service = login_service(driver.current_url)
+            if service and (candidate is None or service == "smu"):
+                candidate = handle, service
+        except (NoSuchWindowException, StaleElementReferenceException):
+            continue
+    if candidate:
+        driver.switch_to.window(candidate[0])
+        driver.switch_to.default_content()
+    return candidate
 
-    while time.time() < end_time:
-        switch_to_latest_window(driver)
-        username_input, password_input = find_login_fields(driver)
-        if username_input and password_input:
-            print("发现登录表单，正在自动填写账号密码...")
-            set_input_value(driver, username_input, username)
-            set_input_value(driver, password_input, password)
-            time.sleep(0.3)
 
-            login_button = find_login_button(driver)
-            if not submit_login(driver, login_button, password_input):
-                print("自动点击登录失败，请手动点击登录按钮。")
+def auto_login_if_needed(driver, accounts, timeout=LOGIN_WAIT_SECONDS):
+    """商城登录 → 统一认证 → 回到会员中心；人工完成验证码，不限于旧倒计时。"""
+    print("正在等待登录；验证码、微信或二次验证请在浏览器手动完成。")
+    deadline = time.monotonic() + timeout
+    attempted = set()
+    announced = set()
+    while time.monotonic() < deadline:
+        if not driver.window_handles:
+            print("浏览器已关闭，停止运行。")
+            return False
+        try:
+            selected = select_login_window(driver)
+            if not selected:
+                if "other" not in announced:
+                    print("当前页面需手动确认；只在 Casmart 和学校认证网站自动填写各自账号。")
+                    announced.add("other")
+                time.sleep(0.5)
+                continue
+            handle, service = selected
+            if service == "ready":
+                print("已确认统一认证完成，正在进入线下单据管理。")
+                return True
 
-            print(f"请在浏览器中完成人机验证，脚本将在 {LOGIN_VERIFY_WAIT_SECONDS} 秒后继续...")
-            countdown(LOGIN_VERIFY_WAIT_SECONDS)
-            wait_page_ready(driver)
-            wait_loading_finished(driver)
-            return True
+            if service == "casmart":
+                sso_button = find_login_action(driver, {"去登录", "统一身份认证登录", "统一认证登录", "学校统一认证登录"})
+                if sso_button and (handle, "sso") not in attempted:
+                    attempted.add((handle, "sso"))
+                    print("发现统一认证提示，正在前往学校登录页面。")
+                    safe_click(driver, sso_button)
+                    continue
 
+            username_input, password_input = find_login_fields(driver)
+            account = accounts.get(service)
+            if username_input and password_input and account and (handle, service) not in attempted:
+                set_input_value(driver, username_input, account["username"])
+                set_input_value(driver, password_input, account["password"])
+                attempted.add((handle, service))
+                extra_inputs = [
+                    element for element in visible_inputs(driver)
+                    if element not in (username_input, password_input)
+                    and (element.get_attribute("type") or "text").lower() in ("text", "tel", "number", "email")
+                ]
+                if service == "casmart" and not extra_inputs:
+                    submit_login(driver, find_login_button(driver), password_input)
+                else:
+                    print("已填写该站账号密码，请在浏览器完成验证码等验证并点击登录。")
+            elif service not in announced:
+                label = "学校统一认证" if service == "smu" else "Casmart"
+                print(f"正在等待{label}登录；如自动填写不适用，可直接在浏览器手动操作。")
+                announced.add(service)
+        except (NoSuchWindowException, StaleElementReferenceException, NoSuchElementException):
+            # 跳转期间元素可能失效，下轮只检查新页面，不重复提交账号密码。
+            pass
         time.sleep(0.5)
-
-    print("未发现登录表单，可能已经处于登录状态。")
+    print("登录等待超时，未开始送审。可重新运行或调大 LOGIN_WAIT_SECONDS。")
     return False
 
 
@@ -852,38 +921,58 @@ def switch_to_latest_window(driver):
 
 
 def ensure_target_page(driver):
-    """登录等待结束后确认浏览器仍在目标页面。"""
-    switch_to_latest_window(driver)
-    current_url = driver.current_url
-    print(f"当前浏览器地址：{current_url}")
+    """只在认证成功后进入单据列表，沿用本次 SSO 回跳的新参数。"""
+    if not is_authenticated_casmart(driver):
+        print("尚未确认登录完成，停止进入业务流程。")
+        return False
 
-    if "member.casmart.com.cn" not in current_url:
-        print("当前不在 Casmart 页面，正在重新跳转...")
-        driver.get("about:blank")
-        time.sleep(1)
-        driver.execute_script("window.location.href = arguments[0];", TARGET_URL)
-        wait_page_ready(driver)
+    current = urlsplit(driver.current_url)
+    if current.path.rstrip("/") != TARGET_PATH:
+        query_keys = {
+            "client-key", "sys_channel", "isGuorun", "institutesHost", "mallHost",
+            "isMainAccount", "ccmyjsForbidSelfManage", "tmmuInstituetsId",
+            "tmmuUserMemberId", "isSHZLSLong", "isSHZLS", "memberUrl",
+        }
+        query = urlencode([(key, value) for key, value in parse_qsl(current.query) if key in query_keys])
+        target = urlunsplit(("https", "member.casmart.com.cn", TARGET_PATH, query, ""))
+        print("已回到会员中心，正在打开线下单据管理。")
+        driver.get(target)
+
+    try:
+        WebDriverWait(driver, WAIT_TIME).until(
+            lambda d: urlsplit(d.current_url).path.rstrip("/") == TARGET_PATH
+            and is_authenticated_casmart(d)
+        )
         wait_loading_finished(driver)
+    except TimeoutException:
+        print("未能确认已进入登录后的线下单据列表，未开始送审。")
+        return False
+    return True
 
 
-def main():
-    credentials = ask_credentials()
-    if not credentials:
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Casmart 登录与线下采购单据送审")
+    parser.add_argument("--login-only", action="store_true", help="只验证登录和进入列表，不执行送审")
+    args = parser.parse_args(argv)
+    credentials = ask_credentials(login_only=args.login_only)
+    if credentials is None:
         print("已取消运行。")
         return
 
-    username, password = credentials
     driver = init_driver()
     total_processed = 0
 
     try:
         print(f"正在打开 Casmart 线下采购单据列表：{TARGET_URL}")
-        driver.get("about:blank")
-        time.sleep(1)
-        driver.execute_script("window.location.href = arguments[0];", TARGET_URL)
+        driver.get(TARGET_URL)
         wait_page_ready(driver)
-        auto_login_if_needed(driver, username, password)
-        ensure_target_page(driver)
+        if not auto_login_if_needed(driver, credentials):
+            return
+        if not ensure_target_page(driver):
+            return
+        if args.login_only:
+            print("登录验证完成；本次仅进入列表，没有执行送审。")
+            return
 
         page_count = 1
         while True:

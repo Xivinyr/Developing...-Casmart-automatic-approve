@@ -19,4 +19,6 @@ playwright/.auth/
 *.har
 *.log
 credentials*.json
+credentials*.bin
+credentials*.tmp
 tokens*.json
