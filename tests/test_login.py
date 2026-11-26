@@ -16,17 +16,26 @@ ACCOUNTS = {
     "casmart": {"username": "synthetic-mall-user", "password": "test-mall-only"},
     "smu": {"username": "synthetic-school-user", "password": "test-school-only"},
 }
+SCHOOL_URL = (
+    "https://uis.smu.edu.cn/login.jsp"
+    "?redirect=https%3a%2f%2fmember.casmart.com.cn%2fapi%2fv2%2fsso_smu%2flogin"
+    "&tmmuUserMemberId=synthetic"
+)
 
 
 class Field:
-    def __init__(self, input_type="text", text="", displayed=True, enabled=True):
+    def __init__(self, input_type="text", text="", displayed=True, enabled=True, **attributes):
         self.input_type = input_type
         self.text = text
         self.displayed = displayed
         self.enabled = enabled
+        self.attributes = attributes
 
     def get_attribute(self, name):
         return self.input_type if name == "type" else ""
+
+    def get_dom_attribute(self, name):
+        return self.attributes.get(name)
 
     def is_displayed(self):
         return self.displayed
@@ -128,6 +137,7 @@ class LoginTests(unittest.TestCase):
             "https://evil.test/?next=https://uis.smu.edu.cn", "https://uis.smu.edu.cn@evil.test",
             "https://member.casmart.com.cn.evil.test", "https://uis.smu.edu.cn:444/login",
             "https://user@uis.smu.edu.cn/login", "https://uis.smu.edu.cn:bad/login", "about:blank",
+            "https://uis.smu.edu.cn/account/change-password",
         ):
             with self.subTest(url=url):
                 self.assertIsNone(songshen.login_service(url))
@@ -139,6 +149,37 @@ class LoginTests(unittest.TestCase):
         self.assertEqual(songshen.find_login_fields(driver), (username, password))
         driver.pages["main"] = (driver.current_url, False, [username, password, Field("password")])
         self.assertEqual(songshen.find_login_fields(driver), (None, None))
+
+    def test_school_fields_ignore_other_passwords_captcha_and_readonly_copy(self):
+        username = Field(placeholder="校园网账号")
+        password = Field("password", placeholder="密码")
+        captcha = Field(placeholder="验证码")
+        driver = PageDriver(authenticated=False)
+        driver.pages["main"] = (
+            driver.current_url, False,
+            [Field("password"), Field(placeholder="校园网账号", readonly="true"),
+             username, password, captcha, Field("password")],
+        )
+        self.assertEqual(songshen.find_school_login_fields(driver), (username, password))
+        driver.pages["main"] = (driver.current_url, False, [username, captcha, Field("password")])
+        self.assertEqual(songshen.find_school_login_fields(driver), (None, None))
+
+    def test_local_sso_entry_keeps_query_and_rejects_unsafe_callbacks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "login-url.txt"
+            path.write_text(SCHOOL_URL + "\n", encoding="utf-8-sig")
+            self.assertEqual(songshen.load_school_login_url(path), SCHOOL_URL)
+            for url in (
+                SCHOOL_URL + "&redirect=https://evil.test",
+                SCHOOL_URL.replace("member.casmart.com.cn", "evil.test"),
+                SCHOOL_URL.replace("uis.smu.edu.cn", "evil.test"),
+                SCHOOL_URL.replace("login.jsp", "change-password"),
+                SCHOOL_URL + "#fragment",
+            ):
+                with self.subTest(url=url):
+                    path.write_text(url, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        songshen.load_school_login_url(path)
 
     def test_login_action_ignores_tabs_and_disabled_buttons(self):
         tab = Field(text="账号登录")
@@ -165,7 +206,7 @@ class LoginTests(unittest.TestCase):
     def test_two_stage_login_fills_separate_accounts_once_and_waits_for_captcha(self):
         driver = Mock(window_handles=["main", "school"])
         mall_user, mall_password = Field(), Field("password")
-        school_user, school_password, captcha = Field(), Field("password"), Field()
+        school_user, school_password = Field(), Field("password")
         sso_button, login_button = Mock(), Mock()
         state = {}
         events = iter(("mall", "sso", "school", "school", "ready"))
@@ -176,29 +217,30 @@ class LoginTests(unittest.TestCase):
             return ("school", "smu") if event == "school" else ("main", "ready" if event == "ready" else "casmart")
 
         def fields(_driver):
-            return (school_user, school_password) if state["event"] == "school" else (mall_user, mall_password)
+            return mall_user, mall_password
 
         def inputs(_driver):
-            return [school_user, school_password, captcha] if state["event"] == "school" else [mall_user, mall_password, Field("checkbox")]
+            return [mall_user, mall_password, Field("checkbox")]
 
         def action(_driver, _labels):
             return sso_button if state["event"] == "sso" else None
 
         with patch.object(songshen, "select_login_window", side_effect=select), \
              patch.object(songshen, "find_login_fields", side_effect=fields), \
+             patch.object(songshen, "find_school_login_fields", return_value=(school_user, school_password)), \
              patch.object(songshen, "visible_inputs", side_effect=inputs), \
              patch.object(songshen, "find_login_action", side_effect=action), \
              patch.object(songshen, "find_login_button", return_value=login_button), \
              patch.object(songshen, "set_input_value") as fill, \
+             patch.object(songshen, "fill_school_account", return_value=True) as school_fill, \
              patch.object(songshen, "submit_login") as submit, \
              patch.object(songshen, "safe_click", return_value=True) as click, \
              patch.object(songshen.time, "sleep"), redirect_stdout(StringIO()):
             self.assertTrue(songshen.auto_login_if_needed(driver, ACCOUNTS, timeout=10))
-        self.assertEqual(fill.call_count, 4)
+        self.assertEqual(fill.call_count, 2)
         fill.assert_any_call(driver, mall_user, ACCOUNTS["casmart"]["username"])
         fill.assert_any_call(driver, mall_password, ACCOUNTS["casmart"]["password"])
-        fill.assert_any_call(driver, school_user, ACCOUNTS["smu"]["username"])
-        fill.assert_any_call(driver, school_password, ACCOUNTS["smu"]["password"])
+        school_fill.assert_called_once_with(school_user, school_password, ACCOUNTS["smu"])
         submit.assert_called_once_with(driver, login_button, mall_password)
         click.assert_called_once_with(driver, sso_button)
 
@@ -234,6 +276,7 @@ class LoginTests(unittest.TestCase):
     def test_main_does_not_submit_before_authentication_or_in_login_only_mode(self):
         for login_ok, target_ok, login_only in ((False, True, False), (True, False, False), (True, True, True)):
             with self.subTest(login_ok=login_ok, target_ok=target_ok, login_only=login_only), \
+                 patch.object(songshen, "load_school_login_url", return_value=SCHOOL_URL), \
                  patch.object(songshen, "ask_credentials", return_value={}), \
                  patch.object(songshen, "init_driver", return_value=Mock()), \
                  patch.object(songshen, "wait_page_ready"), \
@@ -242,6 +285,19 @@ class LoginTests(unittest.TestCase):
                  patch.object(songshen, "process_current_page") as process, redirect_stdout(StringIO()):
                 songshen.main(["--login-only"] if login_only else [])
                 process.assert_not_called()
+
+    def test_main_opens_school_first_and_keeps_mall_as_fallback(self):
+        for args, start_url, direct in (([], SCHOOL_URL, True), (["--via-casmart"], songshen.TARGET_URL, False)):
+            driver = Mock()
+            with self.subTest(direct=direct), \
+                 patch.object(songshen, "load_school_login_url", return_value=SCHOOL_URL), \
+                 patch.object(songshen, "ask_credentials", return_value=ACCOUNTS) as ask, \
+                 patch.object(songshen, "init_driver", return_value=driver), \
+                 patch.object(songshen, "wait_page_ready"), \
+                 patch.object(songshen, "auto_login_if_needed", return_value=False), redirect_stdout(StringIO()):
+                songshen.main(["--login-only", *args])
+            driver.get.assert_called_once_with(start_url)
+            ask.assert_called_once_with(login_only=True, direct=direct)
 
 
 if __name__ == "__main__":

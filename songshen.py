@@ -4,6 +4,7 @@ import sys
 import time
 import tkinter as tk
 from tkinter import messagebox
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from credential_store import delete_credentials, load_credentials, save_credentials
@@ -11,6 +12,7 @@ from credential_store import delete_credentials, load_credentials, save_credenti
 from selenium import webdriver
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
+    InvalidElementStateException,
     NoSuchElementException,
     NoSuchWindowException,
     StaleElementReferenceException,
@@ -37,6 +39,9 @@ TARGET_URL = f"https://member.casmart.com.cn{TARGET_PATH}"
 # 只在这些 HTTPS 网站填写各自的凭证；不硬编码截图中的个人账号或回跳参数。
 CASMART_LOGIN_HOSTS = {"member.casmart.com.cn", "www.casmart.com.cn", "institutes.casmart.com.cn"}
 SMU_LOGIN_HOST = "uis.smu.edu.cn"
+SMU_LOGIN_PATH = "/login.jsp"
+SMU_CASMART_CALLBACK = "https://member.casmart.com.cn/api/v2/sso_smu/login"
+SMU_LOGIN_FILE = Path(__file__).resolve().parent / ".local" / "smu-login-url.txt"
 
 # 如果需要保持登录态，可以填 Edge 用户数据目录，例如：
 # r"C:\Users\你的用户名\AppData\Local\Microsoft\Edge\User Data"
@@ -53,14 +58,15 @@ CANCEL_KEYWORDS = ("取消", "关闭", "返回", "暂不")
 # ------------------
 
 
-def ask_credentials(login_only=False):
-    """分别填写商城与学校账号；勾选后用当前 Windows 用户加密保存。"""
+def ask_credentials(login_only=False, direct=False):
+    """直登只显示学校账号，仍兼容之前的两站保存格式。"""
     result = {"accounts": None}
+    services = (("smu", "学校统一认证"),) if direct else (("casmart", "Casmart"), ("smu", "学校统一认证"))
     root = tk.Tk()
     root.title("Casmart / 学校统一认证")
     root.resizable(False, False)
     root.attributes("-topmost", True)
-    width, height = 500, 340
+    width, height = 500, 240 if direct else 340
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     x = (screen_width - width) // 2
@@ -73,10 +79,11 @@ def ask_credentials(login_only=False):
         saved = {}
         messagebox.showwarning("登录信息", "原保存信息无法读取，可清除后重新保存；也可本次手动填写。", parent=root)
 
-    tk.Label(root, text="两处账号分别填写；留空可在浏览器中手动登录。 ").grid(
+    tip = "直接打开学校统一认证。留空可在浏览器中手动输入。" if direct else "两处账号分别填写；留空可在浏览器中手动登录。"
+    tk.Label(root, text=tip).grid(
         row=0, column=0, columnspan=2, padx=18, pady=(14, 8))
     entries = {}
-    for row, (service, label) in enumerate((("casmart", "Casmart"), ("smu", "学校统一认证"))):
+    for row, (service, label) in enumerate(services):
         for offset, (field, name) in enumerate((("username", "账号"), ("password", "密码"))):
             grid_row = 1 + row * 2 + offset
             tk.Label(root, text=f"{label}{name}：").grid(row=grid_row, column=0, padx=18, pady=7, sticky="e")
@@ -85,11 +92,12 @@ def ask_credentials(login_only=False):
             entry.insert(0, saved.get(service, {}).get(field, ""))
             entries[service, field] = entry
 
-    remember = tk.BooleanVar(root, value=bool(saved))
+    options_row = 1 + 2 * len(services)
+    remember = tk.BooleanVar(root, value=any(service in saved for service, _ in services))
     tk.Checkbutton(root, text="记住账号密码（Windows 当前用户加密）", variable=remember).grid(
-        row=5, column=0, columnspan=2, pady=(6, 2))
+        row=options_row, column=0, columnspan=2, pady=(6, 2))
     tk.Label(root, text="验证码 / 微信 / 二次验证仍需在浏览器手动完成。", fg="#666666").grid(
-        row=6, column=0, columnspan=2, pady=4)
+        row=options_row + 1, column=0, columnspan=2, pady=4)
 
     def paste_to_entry(entry):
         try:
@@ -104,7 +112,8 @@ def ask_credentials(login_only=False):
         return "break"
 
     context_menu = tk.Menu(root, tearoff=0)
-    active_entry = {"widget": entries["casmart", "username"]}
+    first_entry = entries[services[0][0], "username"]
+    active_entry = {"widget": first_entry}
     context_menu.add_command(label="粘贴", command=lambda: paste_to_entry(active_entry["widget"]))
 
     def show_context_menu(event):
@@ -120,7 +129,7 @@ def ask_credentials(login_only=False):
 
     def submit():
         accounts = {}
-        for service in ("casmart", "smu"):
+        for service, _ in services:
             username = entries[service, "username"].get().strip()
             password = entries[service, "password"].get()
             if bool(username) != bool(password):
@@ -129,9 +138,13 @@ def ask_credentials(login_only=False):
             if username:
                 accounts[service] = {"username": username, "password": password}
         try:
-            if remember.get() and accounts:
-                save_credentials(accounts)
-            else:
+            # 直登时保持先前单独保存的商城账号。
+            updated = {name: account for name, account in saved.items() if (name, "username") not in entries}
+            if remember.get():
+                updated.update(accounts)
+            if updated and updated != saved:
+                save_credentials(updated)
+            elif not updated:
                 delete_credentials()
         except (OSError, ValueError):
             messagebox.showerror("保存失败", "无法更新本机保存信息。请检查目录权限，或清除旧信息后重试。", parent=root)
@@ -147,6 +160,7 @@ def ask_credentials(login_only=False):
             return
         for entry in entries.values():
             entry.delete(0, tk.END)
+        saved.clear()
         remember.set(False)
         messagebox.showinfo("已清除", "本机保存的两处账号密码已删除。", parent=root)
 
@@ -154,7 +168,7 @@ def ask_credentials(login_only=False):
         root.destroy()
 
     button_frame = tk.Frame(root)
-    button_frame.grid(row=7, column=0, columnspan=2, pady=(10, 0))
+    button_frame.grid(row=options_row + 2, column=0, columnspan=2, pady=(10, 0))
     start_label = "仅验证登录" if login_only else "登录并开始"
     tk.Button(button_frame, text=start_label, width=12, command=submit).pack(side="left", padx=8)
     tk.Button(button_frame, text="清除保存", width=10, command=clear_saved).pack(side="left", padx=8)
@@ -166,7 +180,7 @@ def ask_credentials(login_only=False):
     root.update_idletasks()
     width, height = max(width, root.winfo_reqwidth()), max(height, root.winfo_reqheight())
     root.geometry(f"{width}x{height}+{(screen_width - width) // 2}+{(screen_height - height) // 2}")
-    entries["casmart", "username"].focus_set()
+    first_entry.focus_set()
     root.mainloop()
 
     return result["accounts"]
@@ -469,6 +483,38 @@ def find_login_fields(driver):
     return username_input, password_input
 
 
+def find_school_login_fields(driver):
+    """从校园网账号框向后找对应密码框，排除验证码和改密区域。"""
+    inputs = [element for element in visible_inputs(driver) if element.get_dom_attribute("readonly") is None]
+    account_inputs = [
+        element for element in inputs
+        if (element.get_attribute("type") or "text").lower() in ("text", "tel", "email", "number")
+    ]
+    usernames = [
+        element for element in account_inputs
+        if (element.get_dom_attribute("placeholder") or "").strip() in {"校园网账号", "请输入校园网账号"}
+    ]
+    if not usernames:
+        account_names = {"username", "loginname", "useraccount", "loginid", "txtusername"}
+        usernames = [
+            element for element in account_inputs
+            if element.get_dom_attribute("autocomplete") == "username"
+            or any((element.get_dom_attribute(attr) or "").lower() in account_names for attr in ("id", "name"))
+        ]
+    if len(usernames) != 1:
+        return None, None
+
+    username = usernames[0]
+    for field in inputs[inputs.index(username) + 1:]:
+        if field in account_inputs:
+            break
+        if (field.get_attribute("type") or "").lower() == "password":
+            if field.get_dom_attribute("autocomplete") == "new-password":
+                break
+            return username, field
+    return None, None
+
+
 def find_login_button(driver):
     # 只匹配真正的登录操作，避免点到“账号登录”标签或整个登录面板。
     return find_login_action(driver, {"登录", "登陆"})
@@ -500,6 +546,18 @@ def set_input_value(driver, element, value):
     )
 
 
+def fill_school_account(username, password, account):
+    """用浏览器键盘事件填写，并确认页面实际保留了两项值。"""
+    pairs = ((username, account["username"]), (password, account["password"]))
+    try:
+        for field, value in pairs:
+            if field.get_property("value") != value:
+                field.send_keys(Keys.CONTROL, "a", Keys.NULL, value)
+        return all(field.get_property("value") == value for field, value in pairs)
+    except InvalidElementStateException:
+        return False
+
+
 def submit_login(driver, login_button, password_input):
     if login_button:
         print(f"正在点击登录按钮：{describe_element(login_button)}")
@@ -524,13 +582,25 @@ def login_service(url):
         parsed = urlsplit(url)
         if parsed.scheme != "https" or parsed.port not in (None, 443) or parsed.username is not None:
             return None
-        if parsed.hostname == SMU_LOGIN_HOST:
+        if parsed.hostname == SMU_LOGIN_HOST and parsed.path == SMU_LOGIN_PATH:
             return "smu"
         if parsed.hostname in CASMART_LOGIN_HOSTS:
             return "casmart"
     except ValueError:
         pass
     return None
+
+
+def load_school_login_url(path=SMU_LOGIN_FILE):
+    """使用本机完整入口，检查学校登录页和 Casmart 回跳地址。"""
+    url = path.read_text(encoding="utf-8-sig").strip()
+    if any(char.isspace() or char == "\\" for char in url) or login_service(url) != "smu":
+        raise ValueError("学校统一认证入口地址无效。")
+    parsed = urlsplit(url)
+    redirects = [value for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key == "redirect"]
+    if parsed.fragment or redirects != [SMU_CASMART_CALLBACK]:
+        raise ValueError("学校统一认证入口的 Casmart 回跳地址无效。")
+    return url
 
 
 def is_authenticated_casmart(driver):
@@ -568,10 +638,11 @@ def select_login_window(driver):
 
 
 def auto_login_if_needed(driver, accounts, timeout=LOGIN_WAIT_SECONDS):
-    """商城登录 → 统一认证 → 回到会员中心；人工完成验证码，不限于旧倒计时。"""
+    """等待学校验证及商城回跳，兼容从商城进入的旧入口。"""
     print("正在等待登录；验证码、微信或二次验证请在浏览器手动完成。")
     deadline = time.monotonic() + timeout
     attempted = set()
+    school_fill_attempts = {}
     announced = set()
     while time.monotonic() < deadline:
         if not driver.window_handles:
@@ -589,6 +660,27 @@ def auto_login_if_needed(driver, accounts, timeout=LOGIN_WAIT_SECONDS):
             if service == "ready":
                 print("已确认统一认证完成，正在进入线下单据管理。")
                 return True
+
+            if service == "smu":
+                account = accounts.get("smu")
+                if account and (handle, service) not in attempted:
+                    username, password = find_school_login_fields(driver)
+                    if username and password:
+                        tries = school_fill_attempts.get(handle, 0) + 1
+                        school_fill_attempts[handle] = tries
+                        # 页面重绘或输入未保留时，只再尝试一次；不提交学校表单。
+                        if tries >= 2:
+                            attempted.add((handle, service))
+                        if fill_school_account(username, password, account):
+                            attempted.add((handle, service))
+                            print("已填写学校账号和密码，请完成页面验证并点击登录。")
+                        elif tries >= 2:
+                            print("学校页面未保留自动填写内容，请手动输入。")
+                if service not in announced and (not account or (handle, service) not in attempted):
+                    announced.add(service)
+                    print("正在等待学校登录。如未预填，可直接在浏览器输入。")
+                time.sleep(0.5)
+                continue
 
             if service == "casmart":
                 sso_button = find_login_action(driver, {"去登录", "统一身份认证登录", "统一认证登录", "学校统一认证登录"})
@@ -609,13 +701,12 @@ def auto_login_if_needed(driver, accounts, timeout=LOGIN_WAIT_SECONDS):
                     if element not in (username_input, password_input)
                     and (element.get_attribute("type") or "text").lower() in ("text", "tel", "number", "email")
                 ]
-                if service == "casmart" and not extra_inputs:
+                if not extra_inputs:
                     submit_login(driver, find_login_button(driver), password_input)
                 else:
                     print("已填写该站账号密码，请在浏览器完成验证码等验证并点击登录。")
             elif service not in announced:
-                label = "学校统一认证" if service == "smu" else "Casmart"
-                print(f"正在等待{label}登录；如自动填写不适用，可直接在浏览器手动操作。")
+                print("正在等待 Casmart 登录。如未预填，可直接在浏览器输入。")
                 announced.add(service)
         except (NoSuchWindowException, StaleElementReferenceException, NoSuchElementException):
             # 跳转期间元素可能失效，下轮只检查新页面，不重复提交账号密码。
@@ -953,23 +1044,33 @@ def ensure_target_page(driver):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Casmart 登录与线下采购单据送审")
     parser.add_argument("--login-only", action="store_true", help="只验证登录和进入列表，不执行送审")
+    parser.add_argument("--via-casmart", action="store_true", help="从商城入口开始登录")
     args = parser.parse_args(argv)
-    credentials = ask_credentials(login_only=args.login_only)
+    direct = not args.via_casmart
+    try:
+        start_url = load_school_login_url(SMU_LOGIN_FILE) if direct else TARGET_URL
+    except (OSError, ValueError):
+        print("请在 .local/smu-login-url.txt 保存完整的学校统一认证入口，或用 --via-casmart 从商城开始。")
+        return
+
+    credentials = ask_credentials(login_only=args.login_only, direct=direct)
     if credentials is None:
         print("已取消运行。")
         return
 
     driver = init_driver()
     total_processed = 0
+    login_finished = False
 
     try:
-        print(f"正在打开 Casmart 线下采购单据列表：{TARGET_URL}")
-        driver.get(TARGET_URL)
+        print("正在打开学校统一认证入口。" if direct else "正在打开 Casmart 入口。")
+        driver.get(start_url)
         wait_page_ready(driver)
         if not auto_login_if_needed(driver, credentials):
             return
         if not ensure_target_page(driver):
             return
+        login_finished = True
         if args.login_only:
             print("登录验证完成；本次仅进入列表，没有执行送审。")
             return
@@ -996,7 +1097,8 @@ def main(argv=None):
         print("\n用户中断脚本。")
         sys.exit(130)
     except Exception as exc:
-        print(f"程序异常终止：{exc}")
+        # 登录导航异常可能包含带个人标识的 URL，只输出异常类型。
+        print(f"程序异常终止：{exc if login_finished else type(exc).__name__}")
     finally:
         print("脚本运行结束，浏览器将保持打开，便于你检查结果。")
         # 如需自动关闭浏览器，取消下一行注释：
