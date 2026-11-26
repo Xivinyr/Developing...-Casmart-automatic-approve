@@ -38,6 +38,7 @@ test('只点击当前工作表里能够核对文件归属的下载按钮', { tim
       return route.abort();
     });
     await page.goto('https://docs.qq.com/sheet/synthetic');
+    await page.locator('button[data-file="good"]').click({ trial: true, timeout: 5000 });
     const downloads = [];
     page.on('download', download => downloads.push(download));
     const selected = (name, assets = []) => ({ text: name + '.pdf', col: 22, invoice_link: true, assets });

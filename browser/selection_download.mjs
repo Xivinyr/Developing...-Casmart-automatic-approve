@@ -147,9 +147,9 @@ export async function downloadVisibleSelectionInvoices(page, sheets) {
       if (!file) continue;
       before = await page.evaluateHandle(inspectAttachment, { ...args, phase: 'before' });
       opened++;
-      await file.click({ timeout: timeLeft(900) });
+      await file.click({ timeout: timeLeft(1800) });
       control = await page.waitForFunction(inspectAttachment, { ...args, phase: 'card', file, before },
-        { timeout: timeLeft(1100), polling: 60 });
+        { timeout: timeLeft(1800), polling: 60 });
       if (Date.now() >= deadline || page.url() !== initialUrl.href) break;
       const button = control.asElement();
       if (!button) continue;
