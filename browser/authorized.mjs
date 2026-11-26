@@ -5,9 +5,13 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { processExport, runAttachments, saveInvoiceDownload } from './export_xlsx.mjs';
+import { hydrateVisibleSelectionInvoices } from './selection_invoices.mjs';
+import { downloadVisibleSelectionInvoices } from './selection_download.mjs';
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
-const [url, python = 'python', config, startCol = 'T'] = process.argv.slice(2);
+const launchArgs = process.argv.slice(2);
+const selectionOnly = launchArgs.includes('--selection-only');
+const [url, python = 'python', config, startCol = 'T', batchName = ''] = launchArgs.filter(arg => arg !== '--selection-only');
 let sheetUrl;
 try { sheetUrl = new URL(url); } catch { /* 下方统一提示地址无效。 */ }
 if (!sheetUrl || sheetUrl.origin !== 'https://docs.qq.com' || sheetUrl.username || sheetUrl.password) {
@@ -15,6 +19,9 @@ if (!sheetUrl || sheetUrl.origin !== 'https://docs.qq.com' || sheetUrl.username 
   process.exit(2);
 }
 const local = path.resolve('.local');
+// 批次名只决定 outputs 下的子目录；前缀与净化后的单段名称避免路径穿越。
+const batch = batchName.trim().replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 40).replace(/^[. ]+|[. ]+$/g, '');
+const selectionOutput = batch ? path.join('outputs', '批次-' + batch) : 'outputs';
 const settings = config ? JSON.parse((await readFile(config,'utf8')).replace(/^\uFEFF/,'')) : {};
 await mkdir(local,{recursive:true});
 const useEdge = process.platform === 'win32' && !existsSync(chromium.executablePath());
@@ -60,6 +67,10 @@ function bind(p) {
       }).catch(() => console.log('发票 PDF 保存失败，请使用浏览器正常下载后选择本地文件夹。'));
       return;
     }
+    if (selectionOnly) {
+      console.log('网页选区任务仅处理已复制的选区和发票 PDF。整本工作簿可从主菜单单独处理。');
+      return;
+    }
     const job = processExport(d, {
       local, python, config, page, onSnapshot: prepared => { lastExport = prepared; },
     }).then(code => {
@@ -77,14 +88,18 @@ function bind(p) {
 }
 try {
   await page.goto(sheetUrl.href, { waitUntil: 'domcontentloaded' });
-  console.log('请在浏览器登录并完成验证。导出 XLSX 后会自动分类，并尝试下载表格保留的发票链接。');
+  if (selectionOnly) {
+    console.log('请在网页打开要报账的工作表，选中本次的 T 到 W 列数据行并按 Ctrl+C。');
+  } else {
+    console.log('请在浏览器登录并完成验证。导出 XLSX 后会自动分类，并尝试下载表格保留的发票链接。');
+  }
   while (!closing.signal.aborted) {
     const command = (await rl.question('复制表格选区后输入 c；下载发票后输入 p；退出输入 q：', { signal: closing.signal })).trim();
     if (command === 'q') break;
     if (command === 'p') {
       const capture = lastCapture || lastExport;
       if (!capture) {
-        console.log('请先导出 XLSX，或复制表格数据行后输入 c。程序需要表格中的发票文件名匹配。');
+        console.log('请先复制表格数据行后输入 c。程序需要选区中的发票文件名匹配。');
         continue;
       }
       const input = (await rl.question('直接回车使用本任务下载的 PDF，或粘贴 PDF 所在文件夹路径：', { signal: closing.signal })).trim();
@@ -94,7 +109,8 @@ try {
         console.log('请核对内容不同的同名发票，再输入 p 并选择已确认的文件夹。');
         continue;
       }
-      const code = await runAttachments(python, ['snapshot', capture, ...configArgs, '--invoice-dir', folder || invoiceDir, '--human']);
+      const output = capture === lastCapture ? selectionOutput : 'outputs';
+      const code = await runAttachments(python, ['snapshot', capture, ...configArgs, '--output', output, '--invoice-dir', folder || invoiceDir, '--human']);
       if (capture === lastCapture) clipboardNeedsReview = code !== 0;
       else exportNeedsReview = code !== 0;
       continue;
@@ -102,7 +118,8 @@ try {
     if (command !== 'c') continue;
     lastCapture = null;
     const prepared = path.join(local,'prepared.json');
-    const preparedCode = await runAttachments(python, ['clipboard','--start-row',String(settings.start_row || 2),'--start-col',startCol,'--prepare',prepared,'--human']);
+    const selectionArgs = selectionOnly ? [...configArgs, '--invoice-links'] : [];
+    const preparedCode = await runAttachments(python, ['clipboard','--start-row',String(settings.start_row || 2),'--start-col',startCol,'--prepare',prepared,'--human', ...selectionArgs]);
     if (preparedCode !== 0) {
       clipboardNeedsReview = true;
       continue;
@@ -126,9 +143,23 @@ try {
       } catch { failures++; }
     }
     const captured = path.join(local,`capture-${crypto.randomUUID()}.json`);
+    if (selectionOnly) {
+      for (const sheet of sheets) sheet.name = '网页选区';
+      const links = await hydrateVisibleSelectionInvoices(page, sheets);
+      if (links.eligible) {
+        const native = await downloadVisibleSelectionInvoices(page, sheets);
+        if (links.downloaded || native.downloaded) {
+          console.log(`网页选区发票：取得 ${links.downloaded} 个直链 PDF，接收 ${native.downloaded} 个网页下载。`);
+        } else if (!links.matched && !native.attempted) {
+          console.log('网页未提供可确认的发票下载入口，已识别的图片仍会分类。');
+        }
+      }
+      await pendingInvoices;
+    }
     await writeFile(captured,JSON.stringify(sheets));
     lastCapture = captured;
-    const code = await runAttachments(python, ['snapshot', captured, ...configArgs, '--human']);
+    const invoiceArgs = selectionOnly && !invoiceConflict && existsSync(invoiceDir) ? ['--invoice-dir', invoiceDir] : [];
+    const code = await runAttachments(python, ['snapshot', captured, ...configArgs, '--output', selectionOutput, ...invoiceArgs, '--human']);
     clipboardNeedsReview = failures > 0 || code !== 0;
     if (failures) console.log(`另有 ${failures} 个显式附件链接未获取。`);
   }

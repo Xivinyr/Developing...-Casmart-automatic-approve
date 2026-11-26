@@ -57,10 +57,12 @@ def report_summary(root, report, human=False):
     print(f'结果目录：{root}')
 
 
-def snapshot(sheets, *, invoice_config=None):
+def snapshot(sheets, *, invoice_config=None, include_filenames=False):
     result = []
     for sheet in sheets:
-        eligible = invoice_link_cells(sheet, invoice_config) if invoice_config is not None else set()
+        eligible = set() if invoice_config is None else invoice_link_cells(
+            sheet, invoice_config, include_filenames=include_filenames,
+        )
         cells = []
         for (row, col), value in sheet.cells.items():
             assets = [
@@ -97,10 +99,10 @@ def main():
     p.add_argument('--invoice-dir', help='已下载发票 PDF 所在文件夹，按表格中的唯一同名文件归类')
     p.add_argument('--human', action='store_true', help='显示便于阅读的结果和缺项说明')
     p.add_argument('--prepare', help='仅输出本地中间模型，供已登录浏览器 Fetch 使用')
-    p.add_argument('--invoice-links', action='store_true', help='标记 XLSX 中配置的发票列链接')
+    p.add_argument('--invoice-links', action='store_true', help='标记配置的发票列中可供在线处理的来源')
     args = p.parse_args()
-    if args.invoice_links and (args.mode != 'xlsx' or not args.prepare):
-        p.error('--invoice-links 仅用于 xlsx --prepare')
+    if args.invoice_links and (args.mode not in ('xlsx', 'clipboard') or not args.prepare):
+        p.error('--invoice-links 仅用于带 --prepare 的 xlsx 或 clipboard')
     config = json.loads(Path(args.config).read_text(encoding='utf-8-sig')) if args.config else {}
     if args.mode == 'xlsx': sheets = read_xlsx(args.input, config.get('sheet'))
     elif args.mode == 'snapshot': sheets = from_snapshot(json.loads(Path(args.input).read_text(encoding='utf-8')))
@@ -111,7 +113,8 @@ def main():
         dest = Path(args.prepare)
         dest.parent.mkdir(parents=True,exist_ok=True)
         invoice_config = config if args.invoice_links else None
-        dest.write_text(json.dumps(snapshot(sheets, invoice_config=invoice_config),ensure_ascii=False),encoding='utf-8')
+        cells = snapshot(sheets, invoice_config=invoice_config, include_filenames=args.mode == 'clipboard')
+        dest.write_text(json.dumps(cells, ensure_ascii=False), encoding='utf-8')
         if args.human:
             print('已读取导出的 XLSX。' if args.mode == 'xlsx' else '已读取表格选区。')
         else:

@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 PROJECT = Path(__file__).resolve().parent
 CONFIG = PROJECT / "config.example.json"
 OUTPUTS = PROJECT / "outputs"
+ONLINE_TASK = "腾讯网页选区分类"
 
 
 def is_tencent_sheet_url(url):
@@ -28,6 +29,38 @@ def is_tencent_sheet_url(url):
         )
     except ValueError:
         return False
+
+
+class SheetSelectionDialog(simpledialog.Dialog):
+    def body(self, parent):
+        ttk.Label(parent, text="腾讯表格链接").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=6)
+        self.url = ttk.Entry(parent, width=48)
+        self.url.grid(row=0, column=1, sticky="ew", pady=6)
+        ttk.Label(parent, text="批次名（可选）").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=6)
+        self.batch = ttk.Entry(parent, width=48)
+        self.batch.grid(row=1, column=1, sticky="ew", pady=6)
+        ttk.Label(parent, text="例如 2026-11，用于区分输出目录。").grid(row=2, column=1, sticky="w")
+        return self.url
+
+    def buttonbox(self):
+        buttons = ttk.Frame(self, padding=(0, 4, 0, 8))
+        ttk.Button(buttons, text="打开网页", command=self.ok).pack(side="left", padx=6)
+        ttk.Button(buttons, text="取消", command=self.cancel).pack(side="left", padx=6)
+        buttons.pack()
+        self.bind("<Return>", self.ok)
+        self.bind("<Escape>", self.cancel)
+
+    def validate(self):
+        url, batch = self.url.get().strip(), self.batch.get().strip()
+        if not is_tencent_sheet_url(url):
+            messagebox.showwarning("链接格式不匹配", "请粘贴 https://docs.qq.com 开头的表格链接。", parent=self)
+            return False
+        if len(batch) > 40:
+            messagebox.showwarning("批次名过长", "请使用不超过 40 个字的批次名。", parent=self)
+            self.initial_focus = self.batch
+            return False
+        self.result = url, batch
+        return True
 
 
 class TaskMenu:
@@ -58,8 +91,8 @@ class TaskMenu:
 
         attachments = ttk.LabelFrame(body, text="腾讯文档附件", padding=(12, 6))
         attachments.grid(sticky="ew", pady=(10, 0))
+        self.add_task(attachments, ONLINE_TASK, "在网页选中当月 T 到 W 列数据并复制，回到任务窗口输入 c。", self.online_sheet)
         self.add_task(attachments, "本地 XLSX 附件分类", "选择已导出的 XLSX，提取并分类其中的附件。", self.local_xlsx)
-        self.add_task(attachments, "腾讯表格下载与分类", "打开指定表格。你在网页导出后，程序自动分类。", self.online_sheet)
 
         footer = ttk.Frame(body)
         footer.grid(sticky="ew", pady=(16, 0))
@@ -129,16 +162,16 @@ class TaskMenu:
             )
             return
 
-        url = simpledialog.askstring("腾讯表格下载与分类", "粘贴腾讯文档表格链接。", parent=self.root)
-        if url is None:
+        selection = SheetSelectionDialog(self.root, ONLINE_TASK).result
+        if selection is None:
             return
-        url = url.strip()
-        if not is_tencent_sheet_url(url):
-            messagebox.showwarning("链接格式不匹配", "请粘贴 https://docs.qq.com 开头的表格链接。", parent=self.root)
-            return
+        url, batch = selection
+        args = [node, str(PROJECT / "browser" / "authorized.mjs"), url, sys.executable, str(CONFIG), "T"]
+        if batch:
+            args.append(batch)
+        args.append("--selection-only")
         self.start(
-            [node, str(PROJECT / "browser" / "authorized.mjs"), url, sys.executable, str(CONFIG), "T"],
-            "腾讯表格下载与分类", console=True, attachment=True, env=env,
+            args, ONLINE_TASK, console=True, attachment=True, env=env,
         )
 
     def start(self, args, label, *, console=False, attachment=False, env=None):

@@ -108,7 +108,7 @@ def cross_category_merges(sheet, columns):
             if len({label for col, label in columns.items() if merge[1] <= col <= merge[3]}) > 1]
 
 
-def invoice_link_cells(sheet, config=None):
+def invoice_link_cells(sheet, config=None, *, include_filenames=False):
     """标记确属发票列、能交给浏览器尝试读取的链接；不把其他列的链接混进来。"""
     config = DEFAULT | (config or {})
     columns = attachment_columns(sheet, config)
@@ -121,7 +121,11 @@ def invoice_link_cells(sheet, config=None):
     if end and end < start:
         return marked
     for (row, col), cell in sheet.cells.items():
-        if col not in invoice_cols or not any(a.data is None and a.source for a in cell.assets):
+        if col not in invoice_cols:
+            continue
+        external = any(a.data is None and a.source for a in cell.assets)
+        selected_filename = include_filenames and invoice_key(cell.text) is not None
+        if not (external or selected_filename):
             continue
         if end and row > end:
             continue

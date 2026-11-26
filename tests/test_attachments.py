@@ -107,6 +107,16 @@ class AttachmentsTests(unittest.TestCase):
         self.assertEqual(r['saved'],2)
         self.assertEqual(r['duplicates'],1)
 
+    def test_browser_selection_marks_only_invoice_candidates(self):
+        sheets = read_html(
+            '<table><tr><td>其他列.pdf</td><td></td><td>当月发票.pdf</td><td></td></tr>'
+            '<tr><td></td><td></td><td>超出范围.pdf</td><td></td></tr></table>'
+        )
+        config = {'start_row': 2, 'end_row': 2}
+        captured = snapshot(sheets, invoice_config=config, include_filenames=True)[0]['cells']
+        self.assertEqual({(c['row'], c['col']) for c in captured if c.get('invoice_link')}, {(2, 22)})
+        self.assertFalse(any(c.get('invoice_link') for c in snapshot(sheets, invoice_config=config)[0]['cells']))
+
     def test_cf_html_offsets_are_bytes(self):
         body = '<table><tr><td>中文</td></tr></table>'.encode()
         header = b'StartFragment:0000000054\r\nEndFragment:0000000000\r\n'
