@@ -125,6 +125,7 @@ try {
       continue;
     }
     const sheets = JSON.parse(await readFile(prepared,'utf8'));
+    if (selectionOnly) console.log('已触发自动检查，正在核对本次选区的发票链接和下载控件。');
     let failures = 0;
     for (const s of sheets) for (const c of s.cells) for (const a of c.assets) {
       if (a.base64 !== null) continue;
@@ -148,11 +149,15 @@ try {
       const links = await hydrateVisibleSelectionInvoices(page, sheets);
       if (links.eligible) {
         const native = await downloadVisibleSelectionInvoices(page, sheets);
-        if (links.downloaded || native.downloaded) {
-          console.log(`网页选区发票：取得 ${links.downloaded} 个直链 PDF，接收 ${native.downloaded} 个网页下载。`);
-        } else if (!links.matched && !native.attempted) {
+        console.log(
+          `发票检查完成。待匹配 ${links.eligible} 份，找到 ${links.matched} 个直链（取得 ${links.downloaded} 份），`
+          + `尝试网页下载 ${native.attempted} 次（收到 ${native.downloaded} 个下载事件）。`,
+        );
+        if (!links.matched && !native.attempted) {
           console.log('网页未提供可确认的发票下载入口，已识别的图片仍会分类。');
         }
+      } else {
+        console.log('发票检查完成。选区里没有待按文件名匹配的 PDF。');
       }
       await pendingInvoices;
     }
