@@ -49,6 +49,7 @@ EDGE_USER_DATA_DIR = ""
 
 WAIT_TIME = 15
 LOGIN_WAIT_SECONDS = 600  # 留出验证码、微信或其他学校验证的人工操作时间。
+LOGIN_POLL_SECONDS = 0.2  # 仅在条件未达到时短暂等待。
 AFTER_SUBMIT_CLICK_SECONDS = 0.3
 AFTER_CONFIRM_CLICK_SECONDS = 3
 MAX_PAGES = 0  # 0 表示不限制页数
@@ -189,6 +190,8 @@ def ask_credentials(login_only=False, direct=False):
 def init_driver():
     """初始化 Edge 浏览器。"""
     options = webdriver.EdgeOptions()
+    # 导航立即返回，登录流程用输入框可见、可编辑作为就绪条件。
+    options.page_load_strategy = "none"
     options.add_argument("--start-maximized")
 
     if EDGE_BINARY_PATH and os.path.exists(EDGE_BINARY_PATH):
@@ -204,12 +207,6 @@ def init_driver():
         driver = webdriver.Edge(options=options)
 
     return driver
-
-
-def wait_page_ready(driver, timeout=WAIT_TIME):
-    WebDriverWait(driver, timeout).until(
-        lambda d: d.execute_script("return document.readyState") == "complete"
-    )
 
 
 def wait_loading_finished(driver, timeout=WAIT_TIME):
@@ -652,9 +649,9 @@ def auto_login_if_needed(driver, accounts, timeout=LOGIN_WAIT_SECONDS):
             selected = select_login_window(driver)
             if not selected:
                 if "other" not in announced:
-                    print("当前页面需手动确认；只在 Casmart 和学校认证网站自动填写各自账号。")
+                    print("正在等待 Casmart 或学校认证页面；如需其他验证，请在浏览器手动完成。")
                     announced.add("other")
-                time.sleep(0.5)
+                time.sleep(LOGIN_POLL_SECONDS)
                 continue
             handle, service = selected
             if service == "ready":
@@ -664,6 +661,7 @@ def auto_login_if_needed(driver, accounts, timeout=LOGIN_WAIT_SECONDS):
             if service == "smu":
                 account = accounts.get("smu")
                 if account and (handle, service) not in attempted:
+                    # 只有两个输入框都可见且可编辑时，才立即填写。
                     username, password = find_school_login_fields(driver)
                     if username and password:
                         tries = school_fill_attempts.get(handle, 0) + 1
@@ -678,8 +676,11 @@ def auto_login_if_needed(driver, accounts, timeout=LOGIN_WAIT_SECONDS):
                             print("学校页面未保留自动填写内容，请手动输入。")
                 if service not in announced and (not account or (handle, service) not in attempted):
                     announced.add(service)
-                    print("正在等待学校登录。如未预填，可直接在浏览器输入。")
-                time.sleep(0.5)
+                    if account:
+                        print("正在等待学校登录表单可用。")
+                    else:
+                        print("请在学校页面填写账号密码并完成验证。")
+                time.sleep(LOGIN_POLL_SECONDS)
                 continue
 
             if service == "casmart":
@@ -711,7 +712,7 @@ def auto_login_if_needed(driver, accounts, timeout=LOGIN_WAIT_SECONDS):
         except (NoSuchWindowException, StaleElementReferenceException, NoSuchElementException):
             # 跳转期间元素可能失效，下轮只检查新页面，不重复提交账号密码。
             pass
-        time.sleep(0.5)
+        time.sleep(LOGIN_POLL_SECONDS)
     print("登录等待超时，未开始送审。可重新运行或调大 LOGIN_WAIT_SECONDS。")
     return False
 
@@ -1030,8 +1031,9 @@ def ensure_target_page(driver):
         driver.get(target)
 
     try:
-        WebDriverWait(driver, WAIT_TIME).until(
+        WebDriverWait(driver, WAIT_TIME, ignored_exceptions=(StaleElementReferenceException,)).until(
             lambda d: urlsplit(d.current_url).path.rstrip("/") == TARGET_PATH
+            and d.execute_script("return document.readyState") == "complete"
             and is_authenticated_casmart(d)
         )
         wait_loading_finished(driver)
@@ -1065,7 +1067,6 @@ def main(argv=None):
     try:
         print("正在打开学校统一认证入口。" if direct else "正在打开 Casmart 入口。")
         driver.get(start_url)
-        wait_page_ready(driver)
         if not auto_login_if_needed(driver, credentials):
             return
         if not ensure_target_page(driver):

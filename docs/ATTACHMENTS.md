@@ -2,9 +2,15 @@
 
 2026-11-25：可运行 MVP。原 `songshen.py` 保留，模块不导入或调用送审代码。旧飞书两个脚本原地保留，未复制私有仓库或浏览器配置。业务规则依据原合并单元格版本的 T/U/V/W、商品识别、合并与哈希去重逻辑独立实现。
 
-## 快速运行
+## 从主程序运行
 
-需要 Python 3.10+；离线入口无需安装第三方 Python 包。当前 Work 环境的 Python 命令别名不可用，验证使用 Codex 随附 Python 3.12.14。
+在项目目录运行 `python main.py`。选“本地 XLSX 附件分类”后打开表格文件，使用项目的 `config.example.json` 配置提取。选“腾讯表格下载与分类”后粘贴链接，在浏览器中登录并用表格菜单导出 XLSX，程序收到文件后立即分类。网页导出和验证由本人操作。
+
+结果统一写到 `outputs/`，可从主窗口打开。在线任务查看完结果后，在该任务的终端输入 `q`，或关闭浏览器。选区复制与 `c` 命令可用来补取 XLSX 没有内嵌的资源，资源能否取得取决于实际页面提供的链接和权限。
+
+## 命令行入口
+
+需要 Python 3.10+，离线附件入口只使用 Python 标准库。
 
 ```powershell
 python -m attachments xlsx "data/报账表.xlsx" --config config.example.json
@@ -21,22 +27,23 @@ T=订单截图、U=支付记录、V=发票、W=开箱实物图。V 的纯文件�
 
 去重范围为同记录同类型；跨类型、跨记录保留相同字节，避免丢失业务归属。每次运行独立目录，文件以排他模式创建，无自动覆盖。
 
-## Chromium 与剪贴板回退
+## 在线浏览器与剪贴板
 
-需 Node.js 20+，使用 Playwright 独立 Chromium，不依赖 Edge。首次安装：
+需 Node.js 20+ 和 Playwright。Windows 已有 Edge 时可直接使用独立的附件浏览器配置。安装包后可运行：
 
 ```powershell
-npm install
+npm install --no-package-lock
 $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path (Get-Location) '.local/pw-browsers'
-npx playwright install chromium
 node browser/authorized.mjs "https://docs.qq.com/sheet/你的表格" "python" "config.example.json" "T"
 ```
 
-第二参数可填写 Python 可执行文件绝对路径。第四参数是选区左上列，复制行号由配置 `start_row` 提供。请选中配置对应的实际区域，不包含表头。手动登录/验证码后，正常菜单导出文件将保存至 `.local/download-随机标识.xlsx`；再运行离线入口。UI 菜单差异尚未针对真实表格自动定位。
+如需安装独立 Chromium，在同样设置了 `PLAYWRIGHT_BROWSERS_PATH` 的终端执行 `npx playwright install chromium --no-shell`。已安装该 Chromium 时，在线任务优先使用它。
+
+第二参数可填写 Python 可执行文件绝对路径。手动登录和验证后，从网页菜单导出的 XLSX 会保存至 `.local/download-随机标识.xlsx`，程序随后调用离线分类器并在终端显示保存数、缺项与输出位置。第四参数是剪贴板选区的左上列，复制行号由配置 `start_row` 提供。选区不要包含表头。
 
 选区 Ctrl+C 后在终端输入 `c`，读取 Windows `HTML Format`，解析 rowspan/colspan、img src、a href，使用当前表格页面正常 Fetch 获取资源，再交给相同分类模块。Fetch 遵循 CORS 与服务端权限；失败如实记录，不绕过验证，不扫描私有网络接口。可多次复制，最后输入 `q`。原站若只复制 canvas/私有格式且无 HTML，会明确失败。
 
-本地登录状态只在 `.local/chromium-profile/`；未操作日常浏览器配置。快照可能包含原始链接或签名，仅在 `.local` 保存，不应分享或提交。Blob URL 有效期受页面限制，跨域资源可能被 CORS 阻止。若图片只是缩略图，当前 Fetch 保存的也只是该资源，不能宣称原图。
+本地登录状态保存在 `.local/chromium-profile/` 或 `.local/edge-attachments-profile/`，与日常浏览器配置分开。快照可能包含原始链接或签名，仅在 `.local` 保存，不应分享或提交。Blob URL 有效期受页面限制，跨域资源可能被 CORS 阻止。若图片只是缩略图，当前 Fetch 保存的也只是该资源，不能宣称原图。
 
 单独离线验证 HTML：`python -m attachments html .local/selection.html --start-row 2 --start-col T`；Windows 剪贴板入口：`python -m attachments clipboard`。脱离浏览器时外链不会自动联网，缺失资源记录 `online_fetch_required`。
 

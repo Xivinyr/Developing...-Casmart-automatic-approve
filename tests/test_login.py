@@ -73,6 +73,11 @@ class PageDriver:
             return [Field(text="[退出]")] if authenticated else []
         return []
 
+    def execute_script(self, script):
+        if script == "return document.readyState":
+            return "complete"
+        raise AssertionError(f"意外脚本: {script}")
+
     def get(self, url):
         self.visited.append(url)
         if self.redirect_to_school:
@@ -164,6 +169,40 @@ class LoginTests(unittest.TestCase):
         driver.pages["main"] = (driver.current_url, False, [username, captcha, Field("password")])
         self.assertEqual(songshen.find_school_login_fields(driver), (None, None))
 
+    def test_school_autofill_runs_on_first_poll_with_editable_fields(self):
+        for state in ("ready", "disabled", "replaced"):
+            with self.subTest(state=state):
+                driver = PageDriver(SCHOOL_URL, authenticated=False)
+                username = Field(placeholder="校园网账号")
+                password = Field("password", enabled=state != "disabled")
+                captcha = Field(placeholder="验证码")
+                driver.pages["main"] = (SCHOOL_URL, False, [username, password, captcha])
+                if state == "replaced":
+                    old_element = Mock()
+                    old_element.is_displayed.side_effect = songshen.StaleElementReferenceException
+                    driver.pages["main"] = (SCHOOL_URL, False, [old_element])
+                waited = []
+
+                def browser_loads_form(seconds):
+                    waited.append(seconds)
+                    if state != "ready" and len(waited) == 1:
+                        password.enabled = True
+                        driver.pages["main"] = (SCHOOL_URL, False, [username, password, captcha])
+
+                def fill(first, second, credentials):
+                    self.assertEqual((first, second), (username, password))
+                    self.assertEqual(credentials, ACCOUNTS["smu"])
+                    self.assertEqual(len(waited), 0 if state == "ready" else 1)
+                    driver.pages["main"] = ("https://member.casmart.com.cn/index", True, [])
+                    return True
+
+                with patch.object(songshen.time, "sleep", side_effect=browser_loads_form), \
+                     patch.object(songshen, "fill_school_account", side_effect=fill) as school_fill, \
+                     patch.object(songshen, "submit_login") as submit, redirect_stdout(StringIO()):
+                    self.assertTrue(songshen.auto_login_if_needed(driver, ACCOUNTS, timeout=1))
+                school_fill.assert_called_once()
+                submit.assert_not_called()
+
     def test_local_sso_entry_keeps_query_and_rejects_unsafe_callbacks(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "login-url.txt"
@@ -254,8 +293,10 @@ class LoginTests(unittest.TestCase):
 
     def test_navigation_uses_current_session_and_discards_redirect(self):
         driver = PageDriver("https://member.casmart.com.cn/index?client-key=synthetic-new-key&sys_channel=false&redirect=https%3A%2F%2Fevil.test")
-        with patch.object(songshen, "wait_loading_finished"), redirect_stdout(StringIO()):
+        with patch.object(driver, "execute_script", side_effect=["loading", "complete"]) as ready, \
+             patch.object(songshen.time, "sleep"), patch.object(songshen, "wait_loading_finished"), redirect_stdout(StringIO()):
             self.assertTrue(songshen.ensure_target_page(driver))
+        self.assertEqual(ready.call_count, 2)
         target = urlsplit(driver.visited[0])
         self.assertEqual(target.hostname, "member.casmart.com.cn")
         self.assertEqual(target.path, songshen.TARGET_PATH)
@@ -279,7 +320,6 @@ class LoginTests(unittest.TestCase):
                  patch.object(songshen, "load_school_login_url", return_value=SCHOOL_URL), \
                  patch.object(songshen, "ask_credentials", return_value={}), \
                  patch.object(songshen, "init_driver", return_value=Mock()), \
-                 patch.object(songshen, "wait_page_ready"), \
                  patch.object(songshen, "auto_login_if_needed", return_value=login_ok), \
                  patch.object(songshen, "ensure_target_page", return_value=target_ok), \
                  patch.object(songshen, "process_current_page") as process, redirect_stdout(StringIO()):
@@ -293,10 +333,10 @@ class LoginTests(unittest.TestCase):
                  patch.object(songshen, "load_school_login_url", return_value=SCHOOL_URL), \
                  patch.object(songshen, "ask_credentials", return_value=ACCOUNTS) as ask, \
                  patch.object(songshen, "init_driver", return_value=driver), \
-                 patch.object(songshen, "wait_page_ready"), \
                  patch.object(songshen, "auto_login_if_needed", return_value=False), redirect_stdout(StringIO()):
                 songshen.main(["--login-only", *args])
             driver.get.assert_called_once_with(start_url)
+            driver.execute_script.assert_not_called()
             ask.assert_called_once_with(login_only=True, direct=direct)
 
 
