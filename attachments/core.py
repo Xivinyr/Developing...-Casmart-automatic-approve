@@ -90,6 +90,49 @@ DEFAULT = dict(header_row=1, start_row=2, end_row=None, product_column=None,
                headers={}, required=['订单截图','支付记录','发票','开箱实物图'])
 
 
+def attachment_columns(sheet, config):
+    if not config['headers']:
+        return {column(key): label for key, label in config['columns'].items()}
+    columns = {}
+    for label, title in config['headers'].items():
+        matches = [c for (r,c), value in sheet.cells.items()
+                   if r == config['header_row'] and value.text.strip() == title]
+        if len(matches) != 1:
+            raise ValueError('Header missing or ambiguous: ' + title)
+        columns[matches[0]] = label
+    return columns
+
+
+def cross_category_merges(sheet, columns):
+    return [merge for merge in sheet.merges
+            if len({label for col, label in columns.items() if merge[1] <= col <= merge[3]}) > 1]
+
+
+def invoice_link_cells(sheet, config=None):
+    """标记确属发票列、能交给浏览器尝试读取的链接；不把其他列的链接混进来。"""
+    config = DEFAULT | (config or {})
+    columns = attachment_columns(sheet, config)
+    # 纵向合并的附件存放在起始格，范围内的任一行仍可使用该附件。
+    ambiguous = cross_category_merges(sheet, columns)
+    start = config['start_row']
+    end = config['end_row']
+    invoice_cols = {col for col, label in columns.items() if label == '发票'}
+    marked = set()
+    if end and end < start:
+        return marked
+    for (row, col), cell in sheet.cells.items():
+        if col not in invoice_cols or not any(a.data is None and a.source for a in cell.assets):
+            continue
+        if end and row > end:
+            continue
+        if row < start and not any(r1 == row and c1 == c2 == col and r2 >= start
+                                   for r1,c1,r2,c2 in sheet.merges):
+            continue
+        if not any(r1 <= row <= r2 and c1 <= col <= c2 for r1,c1,r2,c2 in ambiguous):
+            marked.add((row, col))
+    return marked
+
+
 def _save_file(data, label, root, folder, record, seen):
     ext = extension(data)
     digest = hashlib.sha256(data).hexdigest()
@@ -117,18 +160,11 @@ def classify(sheets, output, config=None, fetch=None, invoice_dir=None):
     invoice_candidates = []
     for si, sheet in enumerate(sheets, 1):
         report['warnings'].extend(sheet.warnings)
-        cols = {column(k):v for k,v in config['columns'].items()}
-        if config['headers']:
-            cols = {}
-            for label, title in config['headers'].items():
-                matches = [c for (r,c), v in sheet.cells.items() if r == config['header_row'] and v.text.strip() == title]
-                if len(matches) != 1: raise ValueError('Header missing or ambiguous: ' + title)
-                cols[matches[0]] = label
+        cols = attachment_columns(sheet, config)
         ambiguous = set()
-        for r1,c1,r2,c2 in sheet.merges:
-            if len({v for c,v in cols.items() if c1 <= c <= c2}) > 1:
-                ambiguous.update((r,c) for r in range(r1,r2+1) for c in cols if c1 <= c <= c2)
-                report['warnings'].append(f'ambiguous_cross_category_merge:sheet{si}:row{r1}')
+        for r1,c1,r2,c2 in cross_category_merges(sheet, cols):
+            ambiguous.update((r,c) for r in range(r1,r2+1) for c in cols if c1 <= c <= c2)
+            report['warnings'].append(f'ambiguous_cross_category_merge:sheet{si}:row{r1}')
         pc = column(config['product_column']) if config['product_column'] else None
         rc = column(config['record_column']) if config['record_column'] else None
         invoice = next((c for c,v in cols.items() if v == '发票'), None)

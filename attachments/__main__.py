@@ -3,7 +3,7 @@ import base64
 from collections import Counter
 import json
 from pathlib import Path
-from .core import Asset, Cell, Sheet, classify, column
+from .core import Asset, Cell, Sheet, classify, column, invoice_link_cells
 from .xlsx import read_xlsx
 from .clipboard import ClipboardInputError, read_html, read_windows_html
 
@@ -57,10 +57,23 @@ def report_summary(root, report, human=False):
     print(f'结果目录：{root}')
 
 
-def snapshot(sheets):
-    return [{'name':s.name,'merges':s.merges,'warnings':s.warnings,'cells':[
-        {'row':r,'col':c,'text':v.text,'assets':[{'source':a.source,'base64':base64.b64encode(a.data).decode() if a.data is not None else None} for a in v.assets]}
-        for (r,c),v in s.cells.items()]} for s in sheets]
+def snapshot(sheets, *, invoice_config=None):
+    result = []
+    for sheet in sheets:
+        eligible = invoice_link_cells(sheet, invoice_config) if invoice_config is not None else set()
+        cells = []
+        for (row, col), value in sheet.cells.items():
+            assets = [
+                {'source': asset.source,
+                 'base64': base64.b64encode(asset.data).decode() if asset.data is not None else None}
+                for asset in value.assets
+            ]
+            cell = {'row': row, 'col': col, 'text': value.text, 'assets': assets}
+            if (row, col) in eligible:
+                cell['invoice_link'] = True
+            cells.append(cell)
+        result.append({'name': sheet.name, 'merges': sheet.merges, 'warnings': sheet.warnings, 'cells': cells})
+    return result
 
 
 def from_snapshot(data):
@@ -84,7 +97,10 @@ def main():
     p.add_argument('--invoice-dir', help='已下载发票 PDF 所在文件夹，按表格中的唯一同名文件归类')
     p.add_argument('--human', action='store_true', help='显示便于阅读的结果和缺项说明')
     p.add_argument('--prepare', help='仅输出本地中间模型，供已登录浏览器 Fetch 使用')
+    p.add_argument('--invoice-links', action='store_true', help='标记 XLSX 中配置的发票列链接')
     args = p.parse_args()
+    if args.invoice_links and (args.mode != 'xlsx' or not args.prepare):
+        p.error('--invoice-links 仅用于 xlsx --prepare')
     config = json.loads(Path(args.config).read_text(encoding='utf-8-sig')) if args.config else {}
     if args.mode == 'xlsx': sheets = read_xlsx(args.input, config.get('sheet'))
     elif args.mode == 'snapshot': sheets = from_snapshot(json.loads(Path(args.input).read_text(encoding='utf-8')))
@@ -94,8 +110,12 @@ def main():
     if args.prepare:
         dest = Path(args.prepare)
         dest.parent.mkdir(parents=True,exist_ok=True)
-        dest.write_text(json.dumps(snapshot(sheets),ensure_ascii=False),encoding='utf-8')
-        print('已读取表格选区。' if args.human else 'Prepared local snapshot')
+        invoice_config = config if args.invoice_links else None
+        dest.write_text(json.dumps(snapshot(sheets, invoice_config=invoice_config),ensure_ascii=False),encoding='utf-8')
+        if args.human:
+            print('已读取导出的 XLSX。' if args.mode == 'xlsx' else '已读取表格选区。')
+        else:
+            print('Prepared local snapshot')
     else:
         root, report = classify(sheets, args.output, config, invoice_dir=args.invoice_dir)
         report_summary(root, report, args.human)

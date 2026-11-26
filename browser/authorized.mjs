@@ -37,6 +37,7 @@ const configArgs = config ? ['--config', config] : [];
 let pendingInvoices = Promise.resolve();
 let invoiceConflict = false;
 let lastCapture = null;
+let lastExport = null;
 let clipboardNeedsReview = false;
 let exportNeedsReview = false;
 context.on('close', () => closing.abort());
@@ -59,7 +60,9 @@ function bind(p) {
       }).catch(() => console.log('发票 PDF 保存失败，请使用浏览器正常下载后选择本地文件夹。'));
       return;
     }
-    const job = processExport(d, { local, python, config }).then(code => {
+    const job = processExport(d, {
+      local, python, config, page, onSnapshot: prepared => { lastExport = prepared; },
+    }).then(code => {
       if (code !== 0) {
         exportNeedsReview = true;
         console.log('导出表格处理需复核，请查看上方结果或检查表格格式。');
@@ -74,13 +77,14 @@ function bind(p) {
 }
 try {
   await page.goto(sheetUrl.href, { waitUntil: 'domcontentloaded' });
-  console.log('请在浏览器登录并完成验证。在表格菜单导出 XLSX 后会自动提取并分类。');
+  console.log('请在浏览器登录并完成验证。导出 XLSX 后会自动分类，并尝试下载表格保留的发票链接。');
   while (!closing.signal.aborted) {
     const command = (await rl.question('复制表格选区后输入 c；下载发票后输入 p；退出输入 q：', { signal: closing.signal })).trim();
     if (command === 'q') break;
     if (command === 'p') {
-      if (!lastCapture) {
-        console.log('请先复制当前表格选区并输入 c，程序需要用选区中的发票文件名匹配。');
+      const capture = lastCapture || lastExport;
+      if (!capture) {
+        console.log('请先导出 XLSX，或复制表格数据行后输入 c。程序需要表格中的发票文件名匹配。');
         continue;
       }
       const input = (await rl.question('直接回车使用本任务下载的 PDF，或粘贴 PDF 所在文件夹路径：', { signal: closing.signal })).trim();
@@ -90,8 +94,9 @@ try {
         console.log('请核对内容不同的同名发票，再输入 p 并选择已确认的文件夹。');
         continue;
       }
-      const code = await runAttachments(python, ['snapshot', lastCapture, ...configArgs, '--invoice-dir', folder || invoiceDir, '--human']);
-      clipboardNeedsReview = code !== 0;
+      const code = await runAttachments(python, ['snapshot', capture, ...configArgs, '--invoice-dir', folder || invoiceDir, '--human']);
+      if (capture === lastCapture) clipboardNeedsReview = code !== 0;
+      else exportNeedsReview = code !== 0;
       continue;
     }
     if (command !== 'c') continue;

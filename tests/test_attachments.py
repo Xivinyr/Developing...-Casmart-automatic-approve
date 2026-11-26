@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from zipfile import ZipFile
+from attachments.__main__ import snapshot
 from attachments.core import Asset, Cell, Sheet, classify, safe
 from attachments.xlsx import read_xlsx
 from attachments.clipboard import fragment, read_html
@@ -76,6 +77,25 @@ class AttachmentsTests(unittest.TestCase):
         self.assertEqual(r['saved'],0)
         self.assertEqual(len(r['records'][0]['missing']),4)
         self.assertNotIn('secret', (root/'manifest.json').read_text(encoding='utf-8'))
+
+    def test_export_link_markers_follow_invoice_header_range_and_merges(self):
+        link = Asset('https://example.test/invoice.pdf')
+        sheet = Sheet('S', {
+            (1, 3): Cell('发票附件', [link]),
+            (1, 4): Cell('支付截图'),
+            (2, 3): Cell('合并的发票', [link]),
+            (3, 4): Cell('支付附件', [link]),
+            (3, 22): Cell('旧默认列', [link]),
+            (4, 3): Cell('跨类型合并', [link]),
+            (5, 3): Cell('发票', [link]),
+            (6, 3): Cell('仅文件名.pdf'),
+            (7, 3): Cell('已有内嵌发票', [Asset('embedded', PDF)]),
+            (8, 3): Cell('超出范围', [link]),
+        }, [(2, 3, 3, 3), (4, 3, 4, 4)])
+        config = {'headers': {'发票': '发票附件', '支付记录': '支付截图'}, 'start_row': 3, 'end_row': 7}
+        marked = snapshot([sheet], invoice_config=config)[0]['cells']
+        self.assertEqual({(c['row'], c['col']) for c in marked if c.get('invoice_link')}, {(2, 3), (5, 3)})
+        self.assertTrue(all('invoice_link' not in c for c in snapshot([sheet])[0]['cells']))
 
     def test_html_spans_data_images_and_void_tags(self):
         src = 'data:image/png;base64,'+base64.b64encode(PNG).decode()
