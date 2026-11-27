@@ -116,7 +116,7 @@ class TaskMenu:
         )
 
     def submit(self):
-        self.start([sys.executable, str(PROJECT / "songshen.py")], "自动送审", console=True)
+        self.start([sys.executable, str(PROJECT / "songshen.py"), "--wait-on-exit"], "自动送审", console=True)
 
     def login_only(self):
         self.start([sys.executable, str(PROJECT / "songshen.py"), "--login-only"], "仅验证登录", console=True)

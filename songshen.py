@@ -56,6 +56,7 @@ AFTER_SUBMIT_CLICK_SECONDS = 0.3
 APPROVAL_LIST_WAIT_SECONDS = 30  # 包括整页暂时没有送审按钮的情况。
 APPROVAL_LIST_STABLE_SECONDS = 1.0
 APPROVAL_LIST_POLL_SECONDS = 0.25
+APPROVAL_EMPTY_RECHECK_SECONDS = 3.0  # 判定本页无单可送审前，再确认一次。
 MAX_PAGES = 0  # 0 表示不限制页数
 SUBMIT_KEYWORDS = ("送审", "提交审核", "提交审批")
 CONFIRM_KEYWORDS = ("确定", "确认", "提交", "送审")
@@ -434,11 +435,12 @@ def read_approval_list(driver, depth=0):
 
 
 def wait_for_approval_list(driver, *, after_order=None, after_page=None, timeout=None, stable_seconds=None):
-    """等有证据的稳定列表。没有按钮时仍在完整等待窗口内继续找。"""
+    """等稳定的列表。持续没有按钮时延时复查，再决定是否结束本页。"""
     timeout = APPROVAL_LIST_WAIT_SECONDS if timeout is None else timeout
     stable_seconds = APPROVAL_LIST_STABLE_SECONDS if stable_seconds is None else stable_seconds
     deadline = time.monotonic() + timeout
     last_signature, stable_since = None, None
+    empty_recheck_started = None
     while True:
         driver.switch_to.default_content()
         url = driver.current_url
@@ -460,13 +462,26 @@ def wait_for_approval_list(driver, *, after_order=None, after_page=None, timeout
         if signature != last_signature:
             last_signature, stable_since = signature, now
         stable = view is not None and now - stable_since >= stable_seconds
-        if stable and (view.first_action or now >= deadline):
+        if stable and view.first_action:
+            if empty_recheck_started is not None:
+                print("复查发现可用的送审按钮，继续处理本页。")
             return view
+        if stable and empty_recheck_started is None and now >= deadline:
+            empty_recheck_started = now
+            # 给复查期间可能发生的重绘留出有上限的就绪时间。
+            deadline = now + APPROVAL_EMPTY_RECHECK_SECONDS + timeout
+            print(f"暂未发现可用送审按钮，等待 {APPROVAL_EMPTY_RECHECK_SECONDS:g} 秒后复查……")
+        if stable and empty_recheck_started is not None:
+            # 表格、按钮或分页有变动就重新计时。完成结论依据的是最新一次读取。
+            if now - max(empty_recheck_started, stable_since) >= APPROVAL_EMPTY_RECHECK_SECONDS:
+                return view
         if now >= deadline:
             if after_order is not None:
                 reason = "确认后列表未达到稳定状态，送审结果待人工核对。"
             elif after_page is not None:
                 reason = "翻页后未看到新的稳定单据数据，请检查浏览器。"
+            elif empty_recheck_started is not None:
+                reason = "复查期间单据列表未恢复稳定，请检查页面。"
             else:
                 reason = "未等到单据列表稳定，请检查是否仍在加载。"
             raise ApprovalListError(reason)
@@ -1035,34 +1050,36 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Casmart 登录与线下采购单据送审")
     parser.add_argument("--login-only", action="store_true", help="只验证登录和进入列表，不执行送审")
     parser.add_argument("--via-casmart", action="store_true", help="从商城入口开始登录")
+    parser.add_argument("--wait-on-exit", action="store_true", help="任务结束后保留结果窗口，回车关闭")
     args = parser.parse_args(argv)
     direct = not args.via_casmart
-    try:
-        start_url = load_school_login_url(SMU_LOGIN_FILE) if direct else TARGET_URL
-    except (OSError, ValueError):
-        print("请在 .local/smu-login-url.txt 保存完整的学校统一认证入口，或用 --via-casmart 从商城开始。")
-        return
-
-    credentials = ask_credentials(login_only=args.login_only, direct=direct)
-    if credentials is None:
-        print("已取消运行。")
-        return
-
-    driver = init_driver()
+    driver = None
     total_processed = 0
     login_finished = False
 
     try:
+        try:
+            start_url = load_school_login_url(SMU_LOGIN_FILE) if direct else TARGET_URL
+        except (OSError, ValueError):
+            print("请在 .local/smu-login-url.txt 保存完整的学校统一认证入口，或用 --via-casmart 从商城开始。")
+            return 2
+
+        credentials = ask_credentials(login_only=args.login_only, direct=direct)
+        if credentials is None:
+            print("已取消运行。")
+            return 0
+
+        driver = init_driver()
         print("正在打开学校统一认证入口。" if direct else "正在打开 Casmart 入口。")
         driver.get(start_url)
         if not auto_login_if_needed(driver, credentials):
-            return
+            return 2
         if not ensure_target_page(driver):
-            return
+            return 2
         login_finished = True
         if args.login_only:
             print("登录验证完成；本次仅进入列表，没有执行送审。")
-            return
+            return 0
 
         page_count = 1
         view = None
@@ -1075,27 +1092,33 @@ def main(argv=None):
                 print(f"已达到最大处理页数：{MAX_PAGES}")
                 break
 
-            if click_next_page(driver):
-                page_count += 1
-                continue
+            # 下一页函数返回已确认的列表，主流程用它开始处理新一页。
+            view = click_next_page(driver, view)
+            if view is None:
+                break
+            page_count += 1
 
-            break
-
-        print(f"\n全部处理完成，本次共触发送审 {total_processed} 条线下采购单据。")
+        print(f"\n处理完成，本次检查 {page_count} 页，共触发送审 {total_processed} 条线下采购单据。")
+        return 0
 
     except ApprovalListError as exc:
         print(f"\n已停止送审：{exc}")
         return 2
     except KeyboardInterrupt:
         print("\n用户中断脚本。")
-        sys.exit(130)
+        return 130
     except Exception as exc:
         # 登录导航异常可能包含带个人标识的 URL，只输出异常类型。
         print(f"程序异常终止：{exc if login_finished else type(exc).__name__}")
+        return 2
     finally:
-        print("脚本运行结束，浏览器将保持打开，便于你检查结果。")
-        # 如需自动关闭浏览器，取消下一行注释：
-        # driver.quit()
+        if driver is not None:
+            print("脚本运行结束，浏览器将保持打开，便于你检查结果。")
+        if args.wait_on_exit:
+            try:
+                input("按回车关闭任务窗口。")
+            except (EOFError, KeyboardInterrupt):
+                pass
 
 
 if __name__ == "__main__":
