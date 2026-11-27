@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh"><meta charset="utf-8"><title>合成单据列表（仅本机测试）</title>
+<style>
+body {font:16px sans-serif} td,th {border:1px solid #aaa;padding:6px}
+.el-message-box,.el-dialog {position:fixed;left:20%;top:20%;background:white;border:2px solid #333;padding:24px}
+.el-loading-mask {position:fixed;inset:0;background:#eee} iframe {width:700px;height:300px}
+</style>
+<label>筛选<input id="filter" value=""></label><label><input id="status" type="checkbox">仅测试</label>
+<table><thead><tr><th id="id-header">单据编号</th><th>商品</th><th>操作</th></tr></thead><tbody></tbody></table>
+<div class="el-pagination"><button class="btn-prev">上一页</button>
+<ul class="el-pager"><li class="active"></li></ul><button class="btn-next">下一页</button></div>
+<script>
+const params=new URLSearchParams(location.search), mode=params.get('mode')||'normal';
+let rows=['GOOD-001','ERR-002','ERR-003','SENT-004','GOOD-005'];
+if(mode==='duplicate') rows.push('ERR-002');
+if(mode==='unknown-header') document.querySelector('#id-header').textContent='商品名';
+if(mode==='two-id-columns') document.querySelector('th:nth-child(2)').textContent='订单号';
+if(mode==='virtual-list') document.querySelector('table').setAttribute('data-virtualized','true');
+if(mode==='unknown-pager') document.querySelector('.el-pagination').className='custom-pages';
+if(mode==='split-table') {
+  const wrapper=document.createElement('div');wrapper.className='el-table';
+  const table=document.querySelector('table');table.before(wrapper);wrapper.append(table);
+  const head=document.createElement('table');head.append(table.querySelector('thead'));wrapper.prepend(head);
+}
+if(mode==='orphan-body') {
+  const head=document.createElement('table');head.append(document.querySelector('thead'));
+  document.querySelector('table').before(head);
+}
+let current=2, size=2;window.pending=null;
+window.events=[];window.deletions=[];window.submits=0;
+function render(){
+  current=Math.min(current,Math.max(1,Math.ceil(rows.length/size)));
+  document.querySelector('tbody').innerHTML=rows.slice((current-1)*size,current*size).map(id=>
+    `<tr><td><a>${id}</a></td><td>合成商品 ${id}</td><td><button onclick="submits++">送审</button>`+
+    (id.startsWith('SENT')?'':`<button class="delete" data-id="${id}"><span>删除</span></button>`)+
+    '</td></tr>').join('');
+  document.querySelector('.active').textContent=current;
+  document.querySelector('.btn-prev').disabled=current===1;
+  document.querySelector('.btn-next').disabled=current>=Math.ceil(rows.length/size);
+  document.querySelectorAll('.delete').forEach(b=>b.onclick=()=>openDelete(b.dataset.id));
+  document.querySelector('.el-loading-mask')?.remove();
+}
+function page(delta){
+  if(mode==='stuck-page') return;
+  current+=delta;
+  // 页码先更新，行稍后返回，用来发现只等页码就继续扫描的错误。
+  document.querySelector('.active').textContent=current;
+  if(mode!=='delayed-no-mask') document.body.insertAdjacentHTML('beforeend','<div class="el-loading-mask">加载中</div>');
+  setTimeout(render,180);
+}
+document.querySelector('.btn-prev').onclick=()=>page(-1);
+document.querySelector('.btn-next').onclick=()=>page(1);
+function finishDelete(id){
+  events.push('confirm:'+id);
+  if(mode==='server-failure') {document.querySelector('.el-message-box')?.remove();return;}
+  if(mode==='change-filter') document.querySelector('#status').checked=true;
+  rows=rows.filter(r=>r!==id);deletions.push(id);
+  document.querySelector('.el-message-box,.el-dialog')?.remove();
+  if(mode==='error-toast')document.body.insertAdjacentHTML('beforeend','<div class="el-message el-message--error">删除失败</div>');
+  setTimeout(render,120);
+}
+function openDelete(id){
+  events.push('open:'+id);pending=id;
+  if(mode==='native') {if(confirm('确认删除订单号：'+id+'？'))finishDelete(id);return;}
+  if(mode==='no-dialog')return;
+  if(mode==='confirm-frame') {
+    document.body.insertAdjacentHTML('beforeend','<div class="el-dialog"><iframe src="/confirm"></iframe></div>');return;
+  }
+  let text=mode==='wrong-dialog'?'确认送审？':mode==='wrong-id'?'确认删除订单号：GOOD-001？':'确认删除订单号：'+id+'？';
+  document.body.insertAdjacentHTML('beforeend',`<div class="el-message-box"><div>${text}</div>
+    <button class="cancel">取消</button><button class="confirm"><span>确定</span></button></div>`);
+  document.querySelector('.cancel').onclick=()=>document.querySelector('.el-message-box').remove();
+  document.querySelector('.confirm').onclick=()=>finishDelete(id);
+  if(mode==='multiple-dialogs')document.body.insertAdjacentHTML('beforeend','<div role="dialog">确认删除？<button>确定</button></div>');
+}
+render();window.ready=true;
+</script></html>
