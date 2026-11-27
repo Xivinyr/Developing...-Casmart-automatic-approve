@@ -87,6 +87,7 @@ class TaskMenu:
         approval = ttk.LabelFrame(body, text="Casmart 采购单据", padding=(12, 6))
         approval.grid(sticky="ew")
         self.add_task(approval, "自动送审", "完成学校认证后，按原流程送审线下采购单据。", self.submit)
+        self.add_task(approval, "采购单据签收", "选分类清单和指定单号，核对附件上传结果后签收。", self.receive_order)
         self.add_task(approval, "删除错误导入订单", "填写明确单号，预览范围并二次确认后逐条删除。", self.delete_orders)
         self.add_task(approval, "仅验证登录", "登录并进入单据列表，适合检查学校认证。", self.login_only)
 
@@ -120,6 +121,10 @@ class TaskMenu:
 
     def login_only(self):
         self.start([sys.executable, str(PROJECT / "songshen.py"), "--login-only"], "仅验证登录", console=True)
+
+    def receive_order(self):
+        self.start([sys.executable, str(PROJECT / "order_receipt.py"), "--execute", "--wait-on-exit"],
+                   "采购单据签收", console=True)
 
     def delete_orders(self):
         # 删除是独立任务，不能由送审或附件分类流程自动触发。

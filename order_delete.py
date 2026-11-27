@@ -27,8 +27,11 @@ MAX_SCAN_PAGES = 200
 PROJECT = Path(__file__).resolve().parent
 
 
-class DeleteStopped(RuntimeError):
-    """无法证明操作安全时停止，保留页面供人工复核。"""
+class OrderListStopped(RuntimeError):
+    """单据列表不能可靠定位时停止，保留页面供人工复核。"""
+
+
+DeleteStopped = OrderListStopped
 
 
 @dataclass(frozen=True)
@@ -36,12 +39,16 @@ class Order:
     order_id: str
     columns: tuple
     cells: tuple
-    deletable: bool
+    actionable: bool
     page: int
 
     @property
     def fingerprint(self):
         return self.columns, self.cells
+
+    @property
+    def deletable(self):
+        return self.actionable
 
 
 @dataclass(frozen=True)
@@ -81,8 +88,11 @@ return containers.map(table => ({
 """
 
 
-class DeleteBrowser:
-    """复用 Selenium 登录、定位和等待机制，删除路径仅允许一次点击。"""
+class OrderListBrowser:
+    """按编号扫描单据和分页，为独立业务任务提供行定位。"""
+    row_labels = frozenset()
+    operation = "操作"
+
     def __init__(self, driver, id_column=None, timeout=shared.WAIT_TIME):
         self.driver, self.id_column, self.timeout = driver, id_column, timeout
         self.window = driver.current_window_handle
@@ -92,14 +102,14 @@ class DeleteBrowser:
     def guard(self):
         d = self.driver
         if d.current_window_handle != self.window or d.window_handles != [self.window]:
-            raise DeleteStopped("窗口范围已改变，停止删除。")
+            raise OrderListStopped("窗口范围已改变，停止本次单据操作。")
         d.switch_to.default_content()
         url = urlsplit(d.current_url)
         if (url.scheme != "https" or url.hostname != "member.casmart.com.cn"
                 or url.port not in (None, 443) or url.username is not None
                 or url.path.rstrip("/") != shared.TARGET_PATH
                 or not shared.is_authenticated_casmart(d)):
-            raise DeleteStopped("登录或单据列表地址已改变，停止删除。")
+            raise OrderListStopped("登录或单据列表地址已改变，停止本次单据操作。")
 
     def enter(self, path):
         self.driver.switch_to.default_content()
@@ -143,7 +153,7 @@ class DeleteBrowser:
             if shared.find_visible_elements(self.driver, By.CSS_SELECTOR,
                     ".el-table-v2,.ant-table-tbody-virtual,.rc-virtual-list,.vue-recycle-scroller,"
                     ".virtual-scroller,.virtual-list,[data-virtualized='true']"):
-                raise DeleteStopped("检测到虚拟滚动列表，无法确认完整范围，未执行删除。")
+                raise OrderListStopped("检测到虚拟滚动列表，无法确认完整范围。")
             # 筛选、每页数量、排序或地址改变后，旧的预览不再有效。
             scopes.append((path, self.driver.execute_script("""
                 return [location.href,
@@ -176,13 +186,13 @@ class DeleteBrowser:
                         # 常见空表提示不属于订单行。
                         if len(cells) == 1 and shared.compact_text(cells[0]) in {"暂无数据", "暂无相关数据", "无数据"}:
                             continue
-                        raise DeleteStopped("表头与订单行不能一一对应，未执行删除。")
+                        raise OrderListStopped("表头与订单行不能一一对应。")
                     order_id = cells[index].strip()
                     if not ID_PATTERN.fullmatch(order_id):
-                        raise DeleteStopped("编号列包含无法可靠识别的编号，未执行删除。")
-                    buttons = self.actions(record["row"], DELETE_LABELS)
+                        raise OrderListStopped("编号列包含无法可靠识别的编号。")
+                    buttons = self.actions(record["row"], self.row_labels)
                     if len(buttons) > 1:
-                        raise DeleteStopped("同一订单行存在多个删除入口，未执行删除。")
+                        raise OrderListStopped(f"同一订单行存在多个{self.operation}入口。")
                     rows.append((Order(order_id, headers, cells, bool(buttons), 0), buttons))
                 tables.append((path, headers, rows))
         if not tables:
@@ -209,7 +219,7 @@ class DeleteBrowser:
         if pager:
             marker = "|".join(e.text for e in pager.find_elements(By.CSS_SELECTOR,
                 ".el-pager .active,.ant-pagination-item-active,.layui-laypage-curr"))
-        signature = (headers, tuple((o.order_id, o.cells, o.deletable) for o, _ in rows), marker)
+        signature = (headers, tuple((o.order_id, o.cells, o.actionable) for o, _ in rows), marker)
         return rows, pager, signature
 
     def page(self):
@@ -260,7 +270,7 @@ class DeleteBrowser:
         raise DeleteStopped("无法确认首页，扫描停止。")
 
     def scan(self, ids):
-        """始终从首页完整扫描；每次删除后重新扫描，避免行移位和跨页漏项。"""
+        """始终从首页完整扫描，避免行移位和跨页漏项。"""
         self.require_no_dialog()
         self.first_page()
         found = {value: [] for value in ids}
@@ -273,13 +283,13 @@ class DeleteBrowser:
             for order, _ in rows:
                 if order.order_id in found:
                     found[order.order_id].append(Order(order.order_id, order.columns, order.cells,
-                                                      order.deletable, number))
+                                                      order.actionable, number))
             if not self.move("next"):
                 return found
-        raise DeleteStopped("超过安全扫描页数，未执行后续删除。")
+        raise OrderListStopped("超过安全扫描页数，无法确认完整范围。")
 
     def click_once(self, button):
-        # 删除及确认不使用带多种点击重试的 safe_click：抛错也可能已被服务器受理。
+        # 业务操作只点击一次，抛错后可能已被服务器受理。
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'})", button)
         button.click()
 
@@ -304,6 +314,26 @@ class DeleteBrowser:
     def require_no_dialog(self):
         if self.alert() is not None or self.modals():
             raise DeleteStopped("存在未处理的弹窗，请人工关闭并重新预览。")
+
+    def row_action(self, approved):
+        """回到已核对的页，重新定位同一条记录的唯一行操作。"""
+        self.guard()
+        self.require_no_dialog()
+        self.first_page()
+        for _ in range(1, approved.page):
+            if not self.move("next"):
+                raise OrderListStopped("目标订单的分页已改变，请重新预览。")
+        rows, _, _ = self.page()
+        matches = [(o, buttons) for o, buttons in rows if o.order_id == approved.order_id]
+        if len(matches) != 1 or matches[0][0].fingerprint != approved.fingerprint or len(matches[0][1]) != 1:
+            raise OrderListStopped("点击前目标订单已改变或无法唯一定位。")
+        return matches[0][1][0]
+
+
+class DeleteBrowser(OrderListBrowser):
+    """单据删除只处理明确指定的目标，每次确认只点击一次。"""
+    row_labels = DELETE_LABELS
+    operation = "删除"
 
     @staticmethod
     def validate_dialog(text, order_id):
@@ -332,18 +362,9 @@ class DeleteBrowser:
         return text, buttons
 
     def delete(self, approved, journal):
-        self.guard()
-        self.require_no_dialog()
-        self.first_page()
-        for _ in range(1, approved.page):
-            if not self.move("next"):
-                raise DeleteStopped("目标订单的分页已改变，请重新预览。")
-        rows, _, _ = self.page()
-        matches = [(o, buttons) for o, buttons in rows if o.order_id == approved.order_id]
-        if len(matches) != 1 or matches[0][0].fingerprint != approved.fingerprint or len(matches[0][1]) != 1:
-            raise DeleteStopped("点击前目标订单已改变或无法唯一定位。")
+        button = self.row_action(approved)
         journal("row_delete_intent", order_id=approved.order_id)
-        self.click_once(matches[0][1][0])
+        self.click_once(button)
 
         def new_dialog(_):
             native = self.alert()
