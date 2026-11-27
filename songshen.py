@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import dataclass
 import os
 import sys
 import time
@@ -14,6 +15,7 @@ from selenium.common.exceptions import (
     ElementClickInterceptedException,
     InvalidElementStateException,
     NoSuchElementException,
+    NoSuchFrameException,
     NoSuchWindowException,
     StaleElementReferenceException,
     TimeoutException,
@@ -51,7 +53,9 @@ WAIT_TIME = 15
 LOGIN_WAIT_SECONDS = 600  # 留出验证码、微信或其他学校验证的人工操作时间。
 LOGIN_POLL_SECONDS = 0.2  # 仅在条件未达到时短暂等待。
 AFTER_SUBMIT_CLICK_SECONDS = 0.3
-AFTER_CONFIRM_CLICK_SECONDS = 3
+APPROVAL_LIST_WAIT_SECONDS = 30  # 包括整页暂时没有送审按钮的情况。
+APPROVAL_LIST_STABLE_SECONDS = 1.0
+APPROVAL_LIST_POLL_SECONDS = 0.25
 MAX_PAGES = 0  # 0 表示不限制页数
 SUBMIT_KEYWORDS = ("送审", "提交审核", "提交审批")
 CONFIRM_KEYWORDS = ("确定", "确认", "提交", "送审")
@@ -320,90 +324,153 @@ def describe_element(element):
         return "<unknown element>"
 
 
-def find_submit_buttons_in_current_context(driver):
-    xpath = (
-        "//*[self::button or self::a or @role='button' or contains(@class, 'el-button') "
-        "or contains(@class, 'ant-btn') or @onclick or self::span]"
-        "[contains(normalize-space(.), '送审') "
-        "or contains(normalize-space(.), '提交审核') "
-        "or contains(normalize-space(.), '提交审批')]"
-    )
-    candidates = find_visible_elements(driver, By.XPATH, xpath)
-
-    buttons = []
-    seen = set()
-    for candidate in candidates:
-        text = element_text(candidate)
-        if not any(keyword in text for keyword in SUBMIT_KEYWORDS):
-            continue
-
-        button = clickable_ancestor(driver, candidate)
-        if not button or not button.is_displayed() or not button.is_enabled():
-            continue
-
-        button_text = element_text(button)
-        if not any(keyword in button_text for keyword in SUBMIT_KEYWORDS):
-            continue
-
-        if is_disabled(button):
-            continue
-
-        element_id = button.id
-        if element_id not in seen:
-            seen.add(element_id)
-            buttons.append(button)
-
-    return buttons
+class ApprovalListError(RuntimeError):
+    pass
 
 
-def find_submit_buttons(driver):
-    """查找当前列表中可点击的“送审”按钮，兼容 iframe 和文字按钮。"""
-    driver.switch_to.default_content()
+@dataclass(frozen=True)
+class ApprovalList:
+    table: object
+    rows: tuple
+    row_text: tuple
+    actions: tuple
+    page: str
+    next_button: object
 
-    buttons = find_submit_buttons_in_current_context(driver)
-    if buttons:
-        return buttons
+    @property
+    def signature(self):
+        return self.table, self.rows, self.row_text, self.actions, self.page, self.next_button
 
-    return find_submit_buttons_in_frames(driver)
+    @property
+    def first_action(self):
+        return next(((key, button) for key, enabled, button in self.actions if enabled), None)
 
 
-def find_submit_buttons_in_frames(driver, depth=0, max_depth=3):
-    if depth >= max_depth:
-        return []
+# readyState 只表示文档资源加载完，订单和行按钮常在随后异步插入。
+# 一次读取同一层的表格和分页，返回行标识仅用于内存中的前后对照。
+READ_APPROVAL_LIST = r"""
+const [labels, expectedOrigin] = arguments;
+const compact = text => (text || '').replace(/\s/g, '');
+const visible = e => e.getClientRects().length &&
+    !['hidden', 'collapse'].includes(getComputedStyle(e).visibility);
+const enabled = e => !e.matches(':disabled,[aria-disabled="true"],.disabled,.is-disabled,.ant-pagination-disabled');
+if (window.origin !== expectedOrigin) return {};
+const loading = '.el-loading-mask,.el-loading-spinner,.v-modal,.ant-spin-spinning,' +
+    '.ant-modal-mask,.layui-layer-loading,.layui-layer-shade,[aria-busy="true"]';
+const dialogs = '.el-message-box,.el-dialog,.ant-modal,.layui-layer-dialog,.layui-layer-iframe,[role="dialog"]';
+if (document.readyState !== 'complete' || [...document.querySelectorAll(loading + ',' + dialogs)].some(visible)) {
+    return {busy: true};
+}
 
-    frames = driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
-    for index in range(len(frames)):
-        try:
-            driver.switch_to.frame(index)
-            buttons = find_submit_buttons_in_current_context(driver)
-            if buttons:
-                print(f"在第 {depth + 1} 层 iframe 中找到送审按钮。")
-                return buttons
+const tableSelector = 'table,.el-table,.ant-table,.layui-table-view,[role="grid"],[role="table"]';
+const actionSelector = 'button,a,[role="button"],.el-button,.ant-btn,.layui-btn,[onclick]';
+const emptyLabel = /^(暂无(?:相关)?数据|无数据|暂无(?:单据|记录)|无记录)$/;
+const tables = [...document.querySelectorAll(tableSelector)].filter(e =>
+    visible(e) && !e.parentElement.closest(tableSelector));
+const lists = [];
+for (const table of tables) {
+    const headers = [...table.querySelectorAll('th,[role="columnheader"]')]
+        .filter(visible).map(e => compact(e.innerText));
+    const idColumns = headers.map((name, i) => [name, i]).filter(([name]) =>
+        /^(线下)?(单据编号|单据号|订单编号|订单号|采购单号|采购单据编号)$/.test(name));
+    const rows = new Set();
+    const rowText = [];
+    const actions = [];
+    let empty = [...table.querySelectorAll('.el-table__empty-text,.ant-empty-description,.layui-none')]
+        .some(e => visible(e) && emptyLabel.test(compact(e.innerText)));
+    for (const row of [...table.querySelectorAll('tbody tr,[role="row"]')].filter(visible)) {
+        const cells = [...row.children].filter(e => e.matches('td,[role="cell"],[role="gridcell"]'));
+        const text = cells.map(e => (e.innerText || e.textContent || '').trim());
+        if (text.length === 1 && emptyLabel.test(compact(text[0]))) {
+            empty = true;
+            continue;
+        }
+        const hasHeaderMap = headers.length === cells.length;
+        const id = hasHeaderMap && idColumns.length === 1 ? text[idColumns[0][1]] : '';
+        const values = text.filter((value, i) => value &&
+            !(hasHeaderMap && /操作|状态/.test(headers[i])) && !cells[i].querySelector('button,[role="button"]'));
+        const key = id || JSON.stringify(values);
+        if (!id && !values.length) continue;
+        rows.add(key);
+        rowText.push(text);
+        for (const button of row.querySelectorAll(actionSelector)) {
+            const label = compact(button.innerText || button.title || button.getAttribute('aria-label'));
+            if (visible(button) && labels.includes(label) &&
+                !button.parentElement.closest('button,a,[role="button"],.el-button,.ant-btn,.layui-btn')) {
+                actions.push([key, enabled(button), button]);
+            }
+        }
+    }
+    const orderHeaders = headers.some(name => /单据|单号|订单/.test(name));
+    if (actions.length || (orderHeaders && (rows.size || empty))) lists.push({table, rows: [...rows], rowText, actions});
+}
+if (lists.length !== 1) return {};
+const marker = [...document.querySelectorAll('.el-pager .active,.el-pager .is-active,.ant-pagination-item-active,' +
+    '.layui-laypage-curr,[class*="pagination"] [aria-current="page"]')].find(visible);
+const next = new Set([...document.querySelectorAll('button.btn-next,li.next,.ant-pagination-next,.layui-laypage-next')]
+    .filter(visible).map(e => [e, e.querySelector('button,a') || e])
+    .filter(([wrapper, button]) => enabled(wrapper) && enabled(button)).map(([, button]) => button));
+if (next.size > 1) return {};
+return {...lists[0], page: marker ? compact(marker.innerText) : '', next: [...next][0] || null};
+"""
 
-            nested_buttons = find_submit_buttons_in_frames(driver, depth + 1, max_depth)
-            if nested_buttons:
-                return nested_buttons
 
+def read_approval_list(driver, depth=0):
+    """从当前层读取，成功时保持在单据所在的 iframe。"""
+    state = driver.execute_script(READ_APPROVAL_LIST, SUBMIT_KEYWORDS, TARGET_URL.removesuffix(TARGET_PATH))
+    if state.get("busy"):
+        return None
+    if state.get("table"):
+        return ApprovalList(state["table"], tuple(state["rows"]), tuple(map(tuple, state["rowText"])),
+                            tuple(map(tuple, state["actions"])), state["page"], state["next"])
+    if depth < 3:
+        for frame in find_visible_elements(driver, By.CSS_SELECTOR, "iframe, frame"):
+            driver.switch_to.frame(frame)
+            listing = read_approval_list(driver, depth + 1)
+            if listing is not None:
+                return listing
             driver.switch_to.parent_frame()
-        except Exception:
-            driver.switch_to.default_content()
-
-    driver.switch_to.default_content()
-    return []
+    return None
 
 
-def print_clickable_debug(driver):
-    """没找到送审时，打印页面上脚本看到的可点击文本，方便定位。"""
-    driver.switch_to.default_content()
-    texts = collect_clickable_texts(driver)
-
-    if not texts:
-        print("调试信息：当前页面没有扫描到可见按钮/链接文本，可能内容在未识别的 iframe 中。")
-        return
-
-    print("调试信息：当前页面可见按钮/链接文本如下：")
-    for text in texts[:30]:
-        print(f"  - {text}")
+def wait_for_approval_list(driver, *, after_order=None, after_page=None, timeout=None, stable_seconds=None):
+    """等有证据的稳定列表。没有按钮时仍在完整等待窗口内继续找。"""
+    timeout = APPROVAL_LIST_WAIT_SECONDS if timeout is None else timeout
+    stable_seconds = APPROVAL_LIST_STABLE_SECONDS if stable_seconds is None else stable_seconds
+    deadline = time.monotonic() + timeout
+    last_signature, stable_since = None, None
+    while True:
+        driver.switch_to.default_content()
+        url = driver.current_url
+        current = urlsplit(url)
+        if (login_service(url) != "casmart" or current.hostname != "member.casmart.com.cn"
+                or current.path.rstrip("/") != TARGET_PATH):
+            raise ApprovalListError("已离开线下单据列表，请检查登录和页面。")
+        try:
+            view = read_approval_list(driver)
+        except (NoSuchElementException, NoSuchFrameException, StaleElementReferenceException):
+            view = None  # 轮询中重绘，下一轮重新定位并重新计时。
+        now = time.monotonic()
+        if view and after_order is not None and any(key == after_order for key, _, _ in view.actions):
+            view = None
+        if view and after_page is not None and (view.rows == after_page.rows or
+                (view.page and after_page.page and view.page == after_page.page)):
+            view = None  # 页码可能先变，旧行仍在；必须观察到新的数据。
+        signature = view.signature if view else None
+        if signature != last_signature:
+            last_signature, stable_since = signature, now
+        stable = view is not None and now - stable_since >= stable_seconds
+        if stable and (view.first_action or now >= deadline):
+            return view
+        if now >= deadline:
+            if after_order is not None:
+                reason = "确认后列表未达到稳定状态，送审结果待人工核对。"
+            elif after_page is not None:
+                reason = "翻页后未看到新的稳定单据数据，请检查浏览器。"
+            else:
+                reason = "未等到单据列表稳定，请检查是否仍在加载。"
+            raise ApprovalListError(reason)
+        time.sleep(min(APPROVAL_LIST_POLL_SECONDS, deadline - now))
 
 
 def collect_clickable_texts(driver, depth=0, max_depth=3):
@@ -878,8 +945,6 @@ def confirm_submit_dialog(driver):
                     print("已尝试点击确认，但确认弹窗仍未关闭。")
                     print_dialog_debug(driver)
                     return False
-                wait_loading_finished(driver)
-                time.sleep(AFTER_CONFIRM_CLICK_SECONDS)
                 return True
             return False
 
@@ -899,111 +964,34 @@ def print_toast_message(driver):
             print(f"系统提示：{text}")
 
 
-def process_current_page(driver):
-    """
-    处理当前页所有可送审的线下采购单据。
-    返回本页成功触发送审的数量。
-    """
+def process_current_page(driver, view=None):
+    """逐条处理稳定列表，确认后重新检查该单据的送审入口。"""
     processed_count = 0
-
-    while True:
-        wait_loading_finished(driver)
-        buttons = find_submit_buttons(driver)
-
-        if not buttons:
-            print("当前页没有更多可送审单据。")
-            if processed_count == 0:
-                print_clickable_debug(driver)
-            break
-
-        try:
-            button = buttons[0]
-            print(f"找到送审按钮，正在处理第 {processed_count + 1} 条：{describe_element(button)}")
-            if not safe_click(driver, button):
-                break
-
-            if confirm_submit_dialog(driver):
-                print("已点击确认按钮，等待系统返回结果...")
-            print_toast_message(driver)
-
-            processed_count += 1
-            time.sleep(1.2)
-
-        except (StaleElementReferenceException, NoSuchElementException):
-            time.sleep(1)
-            continue
-        except Exception as exc:
-            print(f"处理当前单据时出错：{exc}")
-            break
-
-    return processed_count
+    if view is None:
+        print("正在等待单据列表和行操作就绪……")
+        view = wait_for_approval_list(driver)
+    while view.first_action:
+        order_key, button = view.first_action
+        print(f"正在处理本页第 {processed_count + 1} 条可送审单据。")
+        if not safe_click(driver, button) or not confirm_submit_dialog(driver):
+            raise ApprovalListError("送审点击或弹窗确认未完成，请检查浏览器。")
+        print_toast_message(driver)
+        print("正在等待确认后的单据列表刷新……")
+        view = wait_for_approval_list(driver, after_order=order_key)
+        processed_count += 1
+    print("单据列表已稳定，当前页没有可用的送审按钮。")
+    return processed_count, view
 
 
-def click_next_page(driver):
-    """点击分页中的下一页。"""
-    wait_loading_finished(driver)
-    next_btn = find_next_page_button(driver)
-
-    if not next_btn:
-        print("未找到可用的下一页按钮，可能已经是最后一页。")
-        return False
-
-    try:
-        print("正在翻到下一页...")
-        safe_click(driver, next_btn)
-        time.sleep(2)
-        wait_loading_finished(driver)
-        return True
-    except Exception as exc:
-        print(f"翻页出错：{exc}")
-        return False
-
-
-def find_next_page_button(driver):
-    driver.switch_to.default_content()
-    button = find_next_page_button_in_current_context(driver)
-    if button:
-        return button
-
-    return find_next_page_button_in_frames(driver)
-
-
-def find_next_page_button_in_current_context(driver):
-    next_xpath = (
-        "//button[contains(@class, 'btn-next') and not(@disabled) "
-        "and not(contains(@class, 'is-disabled'))]"
-        " | //li[contains(@class, 'next') and not(contains(@class, 'disabled'))]"
-    )
-
-    try:
-        next_btn = WebDriverWait(driver, 2).until(EC.element_to_be_clickable((By.XPATH, next_xpath)))
-        return None if next_btn.get_attribute("disabled") else next_btn
-    except TimeoutException:
+def click_next_page(driver, view):
+    """点击稳定列表的下一页，再等待页码与数据完成切换。"""
+    if view.next_button is None:
+        print("当前列表没有可用的下一页按钮。")
         return None
-
-
-def find_next_page_button_in_frames(driver, depth=0, max_depth=3):
-    if depth >= max_depth:
-        return None
-
-    frames = driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
-    for index in range(len(frames)):
-        try:
-            driver.switch_to.frame(index)
-            button = find_next_page_button_in_current_context(driver)
-            if button:
-                return button
-
-            nested_button = find_next_page_button_in_frames(driver, depth + 1, max_depth)
-            if nested_button:
-                return nested_button
-
-            driver.switch_to.parent_frame()
-        except Exception:
-            driver.switch_to.default_content()
-
-    driver.switch_to.default_content()
-    return None
+    print("正在翻到下一页并等待单据数据更新……")
+    if not safe_click(driver, view.next_button):
+        raise ApprovalListError("未能点击下一页，请检查浏览器。")
+    return wait_for_approval_list(driver, after_page=view)
 
 
 def switch_to_latest_window(driver):
@@ -1077,9 +1065,10 @@ def main(argv=None):
             return
 
         page_count = 1
+        view = None
         while True:
             print(f"\n--- 正在处理第 {page_count} 页 ---")
-            current_count = process_current_page(driver)
+            current_count, view = process_current_page(driver, view)
             total_processed += current_count
 
             if MAX_PAGES and page_count >= MAX_PAGES:
@@ -1094,6 +1083,9 @@ def main(argv=None):
 
         print(f"\n全部处理完成，本次共触发送审 {total_processed} 条线下采购单据。")
 
+    except ApprovalListError as exc:
+        print(f"\n已停止送审：{exc}")
+        return 2
     except KeyboardInterrupt:
         print("\n用户中断脚本。")
         sys.exit(130)
@@ -1107,4 +1099,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
