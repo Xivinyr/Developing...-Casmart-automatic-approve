@@ -87,7 +87,7 @@ class TaskMenu:
         approval = ttk.LabelFrame(body, text="Casmart 采购单据", padding=(12, 6))
         approval.grid(sticky="ew")
         self.add_task(approval, "自动送审", "完成学校认证后，按原流程送审线下采购单据。", self.submit)
-        self.add_task(approval, "采购单据签收", "选择分类批次，按商品名匹配文件夹和材料。", self.receive_order)
+        self.add_task(approval, "采购单据签收", "先选供应商，再按合并单里的商品核对材料。", self.receive_order)
         self.add_task(approval, "自动删除", "预览筛选范围，逐条处理有可用删除按钮的单据。", self.delete_orders)
         self.add_task(approval, "仅验证登录", "登录并进入单据列表，适合检查学校认证。", self.login_only)
 

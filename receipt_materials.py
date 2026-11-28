@@ -47,6 +47,18 @@ class ReceiptPlan:
     product: str
     files: tuple
     warnings: int
+    supplier: str = ""
+
+    @property
+    def names(self):
+        return tuple(file.path.name for file in self.files)
+
+
+@dataclass(frozen=True)
+class SupplierPlan:
+    supplier: str
+    products: tuple[ReceiptPlan, ...]
+    files: tuple[Attachment, ...]
 
     @property
     def names(self):
@@ -117,14 +129,27 @@ def catalog(report):
     return groups
 
 
-def build_plan(manifest, report, product, groups=None):
+def record_supplier(record):
+    value = record.get("supplier")
+    return product_key(value) if isinstance(value, str) else ""
+
+
+def build_plan(manifest, report, product, groups=None, *, supplier=None):
     groups = catalog(report) if groups is None else groups
     selected = groups.get(product_key(product), ())
     if not selected:
         raise ReceiptStopped("分类批次没有同名商品文件夹。")
+    if supplier:
+        tagged = [record for record in selected if record_supplier(record)]
+        if tagged:
+            selected = [record for record in tagged if record_supplier(record) == product_key(supplier)]
+            if not selected:
+                raise ReceiptStopped("同名商品的文件夹属于其他供应商。")
     if len(selected) != 1:
         raise ReceiptStopped("分类批次有同名商品文件夹，请先核对。")
     record = selected[0]
+    if record.get("supplier_conflict"):
+        raise ReceiptStopped("分类记录跨多个供应商，无法确认附件归属。")
     sheet, row = record.get("sheet_index"), record.get("row")
     rows, name, entries = record.get("rows"), record["product"], record.get("files")
     if type(sheet) is not int or sheet < 1 or type(row) is not int or row < 1:
@@ -148,7 +173,31 @@ def build_plan(manifest, report, product, groups=None):
         raise ReceiptStopped("该记录缺少签收所需附件：" + "、".join(sorted(missing)) + "。")
     if len({file.path.name.casefold() for file in files}) != len(files):
         raise ReceiptStopped("待上传文件重名，无法逐个核对上传结果。")
-    return ReceiptPlan(folders.pop(), name, files, len(report.get("warnings", [])))
+    return ReceiptPlan(folders.pop(), name, files, len(report.get("warnings", [])), record_supplier(record))
+
+
+def build_supplier_plan(manifest, report, supplier, products):
+    """完整核对这张合并签收单的所有商品后，再汇总要上传的材料。"""
+    if not products or any(not product_key(name) for name in products):
+        raise ReceiptStopped("签收单没有完整的商品名称。")
+    if len({product_key(name) for name in products}) != len(products):
+        raise ReceiptStopped("该供应商签收页有同名商品，无法分清每个商品对应的文件夹。")
+    groups = catalog(report)
+    matched = []
+    for name in products:
+        try:
+            matched.append(build_plan(manifest, report, name, groups, supplier=supplier))
+        except ReceiptStopped as exc:
+            raise ReceiptStopped(f"商品「{name}」无法匹配材料。{exc}") from exc
+    files = {}
+    for item in matched:
+        for file in item.files:
+            # 同一家、同一张签收单里的同类同内容文件只需上传一次。
+            files.setdefault((file.category, file.sha256), file)
+    unique = tuple(files.values())
+    if len({file.path.name.casefold() for file in unique}) != len(unique):
+        raise ReceiptStopped("签收单有同名但内容不同的附件，无法逐个核对上传结果。")
+    return SupplierPlan(supplier, tuple(matched), unique)
 
 
 def accepts_file(accept, attachment):

@@ -11,27 +11,35 @@ from unittest.mock import Mock, patch
 from attachments.core import Asset, Cell, Sheet, classify
 from order_list import Order
 import order_receipt as receipt
-from receipt_materials import ReceiptStopped, accepts_file, build_plan, load_manifest
+from receipt_materials import ReceiptStopped, accepts_file, build_plan, build_supplier_plan, load_manifest
 
 
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRAAAAABJRU5ErkJggg==")
 PDF = b"%PDF-1.4\nSynthetic fixture\n%%EOF\n"
 PRODUCT = "合成商品"
 OTHER = "另一个商品"
+SUPPLIER = "合成供应商甲"
+OTHER_SUPPLIER = "合成供应商乙"
 
 
-def synthetic_manifest(folder, second=OTHER):
+def synthetic_manifest(folder, second=OTHER, suppliers=(), *, merges=()):
     cells = {}
     for row, name in ((2, PRODUCT), (3, second)):
         for col in (20, 21, 22, 23):
+            # 两种商品共用发票，其余材料由各商品分别提供。
+            data = PDF if col == 22 else PNG + bytes([row])
             cells[row, col] = Cell(name + ".pdf" if col == 22 else "",
-                [Asset("fixture", PDF if col == 22 else PNG)])
-    root, report = classify([Sheet("合成工作表", cells)], Path(folder))
+                [Asset("fixture", data)])
+    if suppliers:
+        cells[1, 5] = Cell("供应商名称")
+        for row, supplier in enumerate(suppliers, start=2):
+            cells[row, 5] = Cell(supplier)
+    root, report = classify([Sheet("合成工作表", cells, list(merges))], Path(folder))
     return root / "manifest.json", report
 
 
-def web_row(product, actionable=True):
-    return Order(("商品名称", "操作"), (product, "签收" if actionable else "查看"), product, actionable, 1, 1)
+def web_row(supplier, actionable=True):
+    return Order(("供应商", "操作"), (supplier, "签收" if actionable else "查看"), "", actionable, 1, 1, supplier)
 
 
 class ReceiptTests(unittest.TestCase):
@@ -58,15 +66,46 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(ReceiptStopped, "附件路径"):
             build_plan(self.path, report, "错误的文件夹名")
 
-    def test_duplicate_names_are_not_matched_and_unique_products_still_ready(self):
-        ready, skipped = receipt.match_receipts(
-            [web_row(PRODUCT), web_row(PRODUCT, False), web_row(OTHER)], self.path, self.report)
-        self.assertEqual([plan.product for _, plan in ready], [OTHER])
-        self.assertIn("同名", skipped[0][1])
+    def test_duplicate_supplier_buttons_are_skipped(self):
+        ready, skipped = receipt.supplier_choices(
+            [web_row(SUPPLIER), web_row(SUPPLIER), web_row(OTHER_SUPPLIER), web_row(OTHER_SUPPLIER, False), web_row("")])
+        self.assertEqual([row.supplier for row in ready], [OTHER_SUPPLIER])
+        self.assertIn("多个", skipped[0][1])
+        self.assertIn("没有", skipped[-1][1])
+
+    def test_untagged_duplicate_products_are_refused(self):
         path, report = synthetic_manifest(self.root, second=PRODUCT)
         report["records"][1]["missing"] = ["发票"]
-        with self.assertRaisesRegex(ReceiptStopped, "同名"):
-            build_plan(path, report, PRODUCT)
+        with self.assertRaisesRegex(ReceiptStopped, "商品「合成商品」.*同名"):
+            build_supplier_plan(path, report, SUPPLIER, [PRODUCT])
+
+    def test_supplier_column_distinguishes_same_named_products(self):
+        path, report = synthetic_manifest(self.root, second=PRODUCT, suppliers=(SUPPLIER, OTHER_SUPPLIER))
+        self.assertEqual([item["supplier"] for item in report["records"]], [SUPPLIER, OTHER_SUPPLIER])
+        plan = build_supplier_plan(path, report, OTHER_SUPPLIER, [PRODUCT])
+        self.assertEqual(plan.products[0].folder.name, "row-000003-合成商品")
+        self.assertEqual(plan.products[0].supplier, OTHER_SUPPLIER)
+        report["records"][1].pop("supplier")
+        with self.assertRaisesRegex(ReceiptStopped, "属于其他供应商"):
+            build_supplier_plan(path, report, "第三家供应商", [PRODUCT])
+
+    def test_merged_supplier_column_keeps_each_product_folder(self):
+        path, report = synthetic_manifest(self.root, suppliers=(SUPPLIER,), merges=((2, 5, 3, 5),))
+        plan = build_supplier_plan(path, report, SUPPLIER, [PRODUCT, OTHER])
+        self.assertEqual([item.supplier for item in plan.products], [SUPPLIER, SUPPLIER])
+        self.assertEqual([item.folder.name for item in plan.products], ["row-000002-合成商品", "row-000003-另一个商品"])
+
+    def test_complete_supplier_group_uploads_shared_invoice_once(self):
+        plan = build_supplier_plan(self.path, self.report, SUPPLIER, [PRODUCT, OTHER])
+        self.assertEqual([item.product for item in plan.products], [PRODUCT, OTHER])
+        self.assertEqual(len(plan.files), 7)
+        self.assertEqual(sum(file.category == "发票" for file in plan.files), 1)
+        self.assertTrue(all(not item.supplier for item in plan.products))
+        self.report["records"][1]["missing"] = ["支付记录"]
+        with self.assertRaisesRegex(ReceiptStopped, "商品「另一个商品」.*缺失"):
+            build_supplier_plan(self.path, self.report, SUPPLIER, [PRODUCT, OTHER])
+        with self.assertRaisesRegex(ReceiptStopped, "签收页有同名商品"):
+            build_supplier_plan(self.path, self.report, SUPPLIER, [PRODUCT, PRODUCT])
 
     def test_missing_attachments_or_selected_record_error_is_rejected(self):
         self.report["errors"] = [{"sheet_index": 1, "row": 3, "code": "fixture"}]
@@ -106,13 +145,19 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(ReceiptStopped, "分类不明确"):
             receipt.upload_groups(slots, self.plan.files)
 
-    def test_form_only_accepts_explicit_exact_matching_product(self):
-        for text in ("签收\n商品名称：合成商品\n材料", "签收\n采购商品\n合成商品\n材料"):
-            self.assertTrue(receipt.product_from_form(dict(products=[], text=text), PRODUCT))
-        self.assertFalse(receipt.product_from_form(dict(products=[], text="备注 合成商品"), PRODUCT))
-        for values in (["合成商品替代"], [PRODUCT, OTHER]):
-            with self.assertRaisesRegex(ReceiptStopped, "不一致"):
-                receipt.product_from_form(dict(products=values, text=""), PRODUCT)
+    def test_form_reads_explicit_products_and_verifies_supplier_when_shown(self):
+        for text, expected in (
+            (f"签收\n供应商：{SUPPLIER}\n商品名称：{PRODUCT}\n采购商品\n{OTHER}\n材料", (PRODUCT, OTHER)),
+            (f"备注 {PRODUCT}", ()),
+        ):
+            form = dict(products=[], suppliers=[], productTables=[], text=text, incomplete=False)
+            self.assertEqual(receipt.form_products(form, SUPPLIER), expected)
+        form.update(suppliers=[OTHER_SUPPLIER], products=[PRODUCT])
+        with self.assertRaisesRegex(ReceiptStopped, "供应商.*不一致"):
+            receipt.form_products(form, SUPPLIER)
+        form.update(suppliers=[SUPPLIER], incomplete=True)
+        with self.assertRaisesRegex(ReceiptStopped, "完整商品"):
+            receipt.form_products(form, SUPPLIER)
 
     def test_upload_feedback_requires_each_exact_filename_and_success_status(self):
         done = [dict(name=name, status="success") for name in self.plan.names]
@@ -126,18 +171,19 @@ class ReceiptTests(unittest.TestCase):
 
     def test_lookup_rejects_new_duplicate_after_preview(self):
         browser = receipt.ReceiptBrowser(Mock(current_window_handle="synthetic"))
-        order = web_row(PRODUCT)
+        order = web_row(SUPPLIER)
         with patch.object(browser, "scan", return_value=(order, order)):
             with self.assertRaisesRegex(ReceiptStopped, "唯一"):
-                browser.find_product(PRODUCT, previous=order)
+                browser.find_supplier(order)
 
     def test_cancel_before_upload_and_after_upload_is_respected(self):
         for consent, upload_count in (([False], 0), ([True, False], 1)):
             with self.subTest(consent=consent), redirect_stdout(StringIO()):
                 browser = Mock()
-                order = web_row(PRODUCT)
-                browser.find_product.return_value = order
-                receipt.run_receipt(browser, order, self.plan, confirm_action=Mock(side_effect=consent))
+                order = web_row(SUPPLIER)
+                browser.find_supplier.return_value = order
+                browser.inspect_products.return_value = (PRODUCT, OTHER)
+                receipt.run_receipt(browser, order, self.path, self.report, confirm_action=Mock(side_effect=consent))
                 self.assertEqual(browser.upload.call_count, upload_count)
                 browser.finish.assert_not_called()
 

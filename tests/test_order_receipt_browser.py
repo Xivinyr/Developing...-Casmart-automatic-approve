@@ -12,28 +12,41 @@ from selenium import webdriver
 from selenium.webdriver.edge.service import Service
 
 import order_receipt as receipt
-from receipt_materials import ReceiptStopped, build_plan
-from test_order_receipt import PRODUCT, synthetic_manifest
+from receipt_materials import ReceiptStopped, build_supplier_plan
+from test_order_receipt import OTHER, OTHER_SUPPLIER, PRODUCT, SUPPLIER, synthetic_manifest
 
 
-FIXTURE = """<!doctype html><meta charset="utf-8">
-<table><thead><tr><th>序号</th><th>商品名称</th><th>操作</th></tr></thead>
-<tbody>
-<tr><td>1</td><td>合成商品</td><td><button onclick="openReceipt('合成商品')">签收</button></td></tr>
-<tr><td>2</td><td>另一个商品</td><td><button onclick="openReceipt('另一个商品')">签收</button></td></tr>
-</tbody></table>
+FIXTURE = r"""<!doctype html><meta charset="utf-8">
+<main></main>
 <script>
 window.events = [];
 const categories = ['订单截图','支付记录','发票','开箱实物图'];
-function openReceipt(product) {
-    events.push(['open', product]);
+const first = '合成供应商甲';
+const second = '合成供应商乙';
+const button = supplier => '<button onclick="openReceipt(\'' + supplier + '\')">签收</button>';
+const rows = mode === 'split' ?
+    '<tr><td rowspan="2">' + first + '</td><td>合成商品</td><td rowspan="2">' + button(first) + '</td></tr>' +
+    '<tr><td>另一个商品</td></tr><tr><td>' + second + '</td><td>合成商品</td><td>' + button(second) + '</td></tr>' :
+    '<tr><td>' + first + '</td><td>' + button(first) + '</td></tr>' +
+    '<tr><td>' + second + '</td><td>' + button(second) + '</td></tr>';
+document.querySelector('main').innerHTML =
+    '<table><thead><tr><th>供应商名称</th>' + (mode === 'split' ? '<th>商品名称</th>' : '') +
+    '<th>操作</th></tr></thead><tbody>' + rows + '</tbody></table>';
+function openReceipt(supplier) {
+    events.push(['open', supplier]);
     const box = document.createElement('div');
     box.className = 'el-dialog';
-    const shown = mode === 'wrong-product' ? '另一个商品' : product;
-    const info = mode === 'split' ? '<table><thead><th>商品名称</th></thead><tbody><tr><td>' + shown +
-        '</td></tr></tbody></table>' : '<p>商品名称：' + shown + '</p>';
+    const vendor = mode === 'wrong-supplier' ? second : supplier;
+    const item = mode === 'unmatched' ? '无材料商品' : '另一个商品';
+    const info = mode === 'split' ?
+        '<div class="el-table"><table><thead><tr><th>供应商</th><th>商品名称</th></tr></thead></table>' +
+        '<table><tbody><tr><td rowspan="2">' + vendor + '</td><td>合成商品</td></tr>' +
+        '<tr><td>' + item + '</td></tr></tbody></table></div>' :
+        '<p>供应商：' + vendor + '</p><table><thead><tr><th>商品名称</th></tr></thead>' +
+        '<tbody><tr><td>合成商品</td></tr><tr><td>' + item + '</td></tr></tbody></table>';
     box.innerHTML = '<h2>单据签收</h2>' + info +
         '<div class="fields"></div><ul class="files"></ul><button class="final" disabled>签收</button>';
+    if (mode === 'paginated') box.insertAdjacentHTML('beforeend', '<div class="el-pagination">下一页</div>');
     const list = box.querySelector('.files');
     function addStatus(name, status) {
         const row = document.createElement('li');
@@ -54,7 +67,7 @@ function openReceipt(product) {
         input.id = 'upload-' + index;
         input.type = 'file';
         input.style.display = 'none';
-        input.multiple = !category;
+        input.multiple = category !== '发票';
         input.accept = category === '发票' ? 'application/pdf' : category ? 'image/*' : 'image/*,application/pdf';
         const label = document.createElement('label');
         label.htmlFor = input.id;
@@ -66,14 +79,14 @@ function openReceipt(product) {
                 const row = addStatus(name, 'uploading');
                 setTimeout(() => {
                     row.dataset.uploadStatus = mode === 'failed' ? 'error' : 'success';
-                    final.disabled = list.querySelectorAll('[data-upload-status="success"]').length !== 4;
+                    final.disabled = list.querySelectorAll('[data-upload-status="success"]').length !== 7;
                 }, 140);
             });
         };
         box.querySelector('.fields').append(label, input);
     });
     final.onclick = () => {
-        events.push(['finish', product]);
+        events.push(['finish', supplier]);
         box.remove();
         const message = document.createElement('div');
         message.setAttribute('role', 'status');
@@ -112,9 +125,9 @@ class ReceiptBrowserTests(unittest.TestCase):
     def setUp(self):
         temp = TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        path, report = synthetic_manifest(temp.name)
+        path, report = synthetic_manifest(temp.name, suppliers=(SUPPLIER, SUPPLIER))
         self.manifest, self.report = path, report
-        self.plan = build_plan(path, report, PRODUCT)
+        self.plan = build_supplier_plan(path, report, SUPPLIER, [PRODUCT, OTHER])
 
     def start(self, mode):
         html = "<script>const mode=" + json.dumps(mode) + ";</script>" + FIXTURE
@@ -126,9 +139,10 @@ class ReceiptBrowserTests(unittest.TestCase):
         return self.driver.execute_script("return window.events")
 
     def execute(self, browser, consent=lambda *_: True):
-        ready, _skipped = receipt.match_receipts(browser.scan(), self.manifest, self.report)
-        selection = next(pair for pair in ready if pair[1].product == PRODUCT)
-        receipt.run_receipt(browser, *selection, confirm_action=consent)
+        ready, _skipped = receipt.supplier_choices(browser.scan())
+        self.assertCountEqual([row.supplier for row in ready], [SUPPLIER, OTHER_SUPPLIER])
+        selection = next(row for row in ready if row.supplier == SUPPLIER)
+        receipt.run_receipt(browser, selection, self.manifest, self.report, confirm_action=consent)
 
     def test_upload_all_and_confirm_same_order_for_single_and_split_forms(self):
         for mode in ("single", "split"):
@@ -136,23 +150,35 @@ class ReceiptBrowserTests(unittest.TestCase):
                 browser = self.start(mode)
                 self.execute(browser)
                 events = self.events()
-                self.assertEqual(events[0], ["open", PRODUCT])
-                self.assertEqual(events[-1], ["finish", PRODUCT])
+                self.assertEqual(events[0], ["open", SUPPLIER])
+                self.assertEqual(events[-1], ["finish", SUPPLIER])
                 sent = [item for item in events if item[0] == "upload"]
                 self.assertCountEqual([name for _, _, names in sent for name in names], self.plan.names)
                 if mode == "split":
-                    self.assertCountEqual([label for _, label, _ in sent], [file.category for file in self.plan.files])
+                    self.assertCountEqual([label for _, label, _ in sent], {file.category for file in self.plan.files})
                     for _, label, names in sent:
                         self.assertEqual(names, [file.path.name for file in self.plan.files if file.category == label])
                 self.assertIn("签收成功", output.getvalue())
 
-    def test_wrong_product_or_existing_attachments_stop_before_upload(self):
-        for mode, reason in (("wrong-product", "不一致"), ("existing", "已经有附件")):
+    def test_unsafe_detail_stops_before_upload(self):
+        for mode, reason in (("wrong-supplier", "供应商.*不一致"), ("unmatched", "无材料商品"),
+                             ("paginated", "完整商品"), ("existing", "已经有附件")):
             with self.subTest(mode=mode), redirect_stdout(StringIO()):
                 browser = self.start(mode)
                 with self.assertRaisesRegex(ReceiptStopped, reason):
                     self.execute(browser)
-                self.assertEqual(self.events(), [["open", PRODUCT]])
+                self.assertEqual(self.events(), [["open", SUPPLIER]])
+
+    def test_products_changed_after_confirmation_are_never_uploaded(self):
+        browser = self.start("single")
+
+        def consent(*_args):
+            self.driver.execute_script("document.querySelector('.el-dialog tbody tr:last-child td').textContent = '变更商品'")
+            return True
+
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(ReceiptStopped, "清单.*变化"):
+            self.execute(browser, consent=consent)
+        self.assertEqual(self.events(), [["open", SUPPLIER]])
 
     def test_upload_error_does_not_reach_final_confirmation(self):
         browser = self.start("failed")
@@ -160,7 +186,7 @@ class ReceiptBrowserTests(unittest.TestCase):
         with redirect_stdout(StringIO()):
             with self.assertRaisesRegex(ReceiptStopped, "上传失败"):
                 self.execute(browser, consent=consent)
-        consent.assert_called_once_with("上传", PRODUCT)
+        consent.assert_called_once_with("上传", SUPPLIER)
         self.assertEqual([event[0] for event in self.events()], ["open", "upload"])
 
     def test_ambiguous_completion_causes_no_retry(self):

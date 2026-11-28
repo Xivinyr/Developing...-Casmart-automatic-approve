@@ -9,6 +9,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
 import songshen as shared
+from attachments.core import SUPPLIER_HEADERS
 
 
 PROJECT = Path(__file__).resolve().parent
@@ -22,7 +23,7 @@ MAX_SCAN_PAGES = 200
 
 
 def product_key(value):
-    """按完整商品名比较，消除显示换行和 Unicode 组合差异。"""
+    """完整名称匹配，统一网页显示空白及等价 Unicode 字符。"""
     return " ".join(normalize("NFC", value).split())
 
 
@@ -38,6 +39,7 @@ class Order:
     actionable: bool
     page: int = 0
     position: int = 0
+    supplier: str = ""
 
     @property
     def details(self):
@@ -69,12 +71,15 @@ const containers = [...document.querySelectorAll('.el-table,.ant-table,table')]
     .filter(e => visible(e) && !e.parentElement.closest('.el-table,.ant-table,table'));
 return containers.map(table => {
     const headers = [...table.querySelectorAll('thead th')].filter(visible);
+    const bodies = [...table.querySelectorAll('tbody')];
     return {
         headers: headers.map(e => e.innerText.trim()),
         complex: headers.some(e => e.colSpan !== 1 || e.rowSpan !== 1),
         rows: [...table.querySelectorAll('tbody tr')].filter(visible).map(row => ({
             row,
             cells: [...row.children].filter(e => e.tagName === 'TD').map(e => e.innerText.trim()),
+            spans: [...row.children].filter(e => e.tagName === 'TD').map(e => [e.rowSpan, e.colSpan]),
+            group: bodies.indexOf(row.parentElement),
             merged: [...row.children].some(e => e.colSpan !== 1 || e.rowSpan !== 1)
         }))
     };
@@ -97,14 +102,55 @@ LOADING = ".el-loading-mask,.el-loading-spinner,.ant-spin-spinning,[aria-busy='t
 PAGERS = ".el-pagination,.ant-pagination,.layui-laypage"
 
 
+def aligned_rows(entries, width, *, allow_rowspan=False):
+    """将纵向合并格的文本对齐到所属列。实际操作仍走原行。"""
+    pending = {}
+    group = None
+    for number, entry in enumerate(entries):
+        cells = tuple(entry["cells"])
+        if len(cells) == 1 and shared.compact_text(cells[0]) in EMPTY_LABELS:
+            if pending:
+                raise OrderListStopped("合并格跨越了空占位行。")
+            continue
+        if pending and entry["group"] != group:
+            raise OrderListStopped("合并行跨越了多个表体。")
+        group = entry["group"]
+        if allow_rowspan and (entry["merged"] or pending):
+            visual_cells = []
+            physical = iter(zip(cells, entry["spans"]))
+            for col in range(width):
+                if col in pending:
+                    value, last = pending[col]
+                    visual_cells.append(value)
+                    if last == number:
+                        del pending[col]
+                    continue
+                cell = next(physical, None)
+                if cell is None:
+                    break
+                value, (vertical, horizontal) = cell
+                if horizontal != 1 or vertical < 1 or number + vertical > len(entries):
+                    raise OrderListStopped("合并行的单元格结构无法核对。")
+                if vertical > 1:
+                    pending[col] = value, number + vertical - 1
+                visual_cells.append(value)
+            if next(physical, None) is not None:
+                raise OrderListStopped("合并行有无法对应的单元格。")
+            cells = tuple(visual_cells)
+        if (entry["merged"] and not allow_rowspan) or len(cells) != width:
+            raise OrderListStopped("表头与订单行不能一一对应。")
+        yield entry, cells
+
+
 class OrderListBrowser:
     row_labels = frozenset()
     operation = "操作"
-    require_product = False
+    require_supplier = False
 
-    def __init__(self, driver, product_column=None, timeout=shared.WAIT_TIME):
+    def __init__(self, driver, product_column=None, timeout=shared.WAIT_TIME, *, supplier_column=None):
         self.driver = driver
         self.product_column = shared.compact_text(product_column)
+        self.supplier_column = shared.compact_text(supplier_column)
         self.timeout = timeout
         self.window = driver.current_window_handle
         self.scope = None
@@ -151,19 +197,15 @@ class OrderListBrowser:
                 found[button.id] = button
         return list(found.values())
 
-    def table_rows(self, table, headers, product_index):
+    def table_rows(self, table, headers, product_index, supplier_index):
         rows, rendered = [], []
-        for entry in table["rows"]:
-            cells = tuple(entry["cells"])
-            if len(cells) == 1 and shared.compact_text(cells[0]) in EMPTY_LABELS:
-                continue
-            if entry["merged"] or len(cells) != len(headers):
-                raise OrderListStopped("表头与订单行不能一一对应。")
+        for entry, cells in aligned_rows(table["rows"], len(headers), allow_rowspan=self.require_supplier):
             buttons = self.actions(entry["row"], self.row_labels)
             if len(buttons) > 1:
                 raise OrderListStopped(f"同一订单行存在多个{self.operation}入口。")
             product = cells[product_index] if product_index is not None else ""
-            order = Order(headers, cells, product, bool(buttons))
+            supplier = cells[supplier_index] if supplier_index is not None else ""
+            order = Order(headers, cells, product, bool(buttons), supplier=supplier)
             rows.append((order, buttons[0] if buttons else None))
             rendered.append(entry["row"].id)
         return tuple(rows), tuple(rendered)
@@ -186,9 +228,11 @@ class OrderListBrowser:
                 headers = tuple(shared.compact_text(label) for label in table["headers"])
                 product_labels = {self.product_column} if self.product_column else PRODUCT_COLUMNS
                 indices = [i for i, label in enumerate(headers) if label in product_labels]
-                if self.require_product and not indices:
+                supplier_labels = {self.supplier_column} if self.supplier_column else SUPPLIER_HEADERS
+                vendors = [i for i, label in enumerate(headers) if label in supplier_labels]
+                if self.require_supplier and not vendors:
                     continue
-                known_list = bool(set(headers) & LIST_COLUMNS or indices
+                known_list = bool(set(headers) & LIST_COLUMNS or indices or (self.require_supplier and vendors)
                                   or self.scope is not None and self.scope[1:] == (path, headers))
                 if not known_list:
                     # 某些列表的列名不同，行内精确操作按钮也能定位列表。
@@ -196,9 +240,10 @@ class OrderListBrowser:
                         continue
                 if table["complex"] or any(not other["headers"] and other["rows"] for other in context_tables):
                     raise OrderListStopped("表头或表体结构不明确，无法确认完整范围。")
-                if self.require_product and len(indices) != 1:
-                    raise OrderListStopped("商品名称列不唯一，请指定使用的表头。")
-                rows, rendered = self.table_rows(table, headers, indices[0] if len(indices) == 1 else None)
+                if self.require_supplier and len(vendors) != 1:
+                    raise OrderListStopped("供应商列不唯一，请指定使用的表头。")
+                rows, rendered = self.table_rows(table, headers, indices[0] if len(indices) == 1 else None,
+                                                 vendors[0] if len(vendors) == 1 else None)
                 tables.append((path, headers, rows, rendered))
         if not tables:
             return None
@@ -245,7 +290,12 @@ class OrderListBrowser:
         try:
             return WebDriverWait(self.driver, self.timeout, poll_frequency=0.2).until(stable)
         except TimeoutException as exc:
-            message = "翻页后未看到稳定的新列表。" if changed else "列表未稳定或无法识别单据表格。"
+            if changed:
+                message = "翻页后未看到稳定的新列表。"
+            elif self.require_supplier:
+                message = "列表未稳定或无法识别供应商列。可按实际表头指定供应商列。"
+            else:
+                message = "列表未稳定或无法识别单据表格。"
             raise OrderListStopped(message) from exc
 
     def move(self, direction, page):

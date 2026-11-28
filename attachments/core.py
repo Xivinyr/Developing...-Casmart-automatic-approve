@@ -87,7 +87,9 @@ def extension(data):
 
 DEFAULT = dict(header_row=1, start_row=2, end_row=None, product_column=None,
                record_column=None, columns={'T':'订单截图','U':'支付记录','V':'发票','W':'开箱实物图'},
-               headers={}, required=['订单截图','支付记录','发票','开箱实物图'])
+               headers={}, required=['订单截图','支付记录','发票','开箱实物图'], supplier_column=None)
+
+SUPPLIER_HEADERS = frozenset({"供应商", "供应商名称", "供货商", "供货商名称", "商家", "商家名称", "店铺", "店铺名称"})
 
 
 def attachment_columns(sheet, config):
@@ -101,6 +103,15 @@ def attachment_columns(sheet, config):
             raise ValueError('Header missing or ambiguous: ' + title)
         columns[matches[0]] = label
     return columns
+
+
+def supplier_column(sheet, config):
+    """完整工作簿可识别供应商表头，裁切后的旧选区仍按原流程分类。"""
+    if config["supplier_column"]:
+        return column(config["supplier_column"])
+    matches = [col for (row, col), cell in sheet.cells.items()
+               if row == config["header_row"] and "".join(cell.text.rstrip("：: ").split()) in SUPPLIER_HEADERS]
+    return matches[0] if len(matches) == 1 else None
 
 
 def cross_category_merges(sheet, columns):
@@ -171,6 +182,7 @@ def classify(sheets, output, config=None, fetch=None, invoice_dir=None):
             report['warnings'].append(f'ambiguous_cross_category_merge:sheet{si}:row{r1}')
         pc = column(config['product_column']) if config['product_column'] else None
         rc = column(config['record_column']) if config['record_column'] else None
+        supplier_col = supplier_column(sheet, config)
         invoice = next((c for c,v in cols.items() if v == '发票'), None)
         end = config['end_row'] or max([r for r,c in sheet.cells] + [m[2] for m in sheet.merges] + [1])
         groups = {}
@@ -189,6 +201,14 @@ def classify(sheets, output, config=None, fetch=None, invoice_dir=None):
             explicit_sources = set()
             invoice_names = {}
             rec = {'sheet_index':si, 'row':origin, 'rows':rows, 'product':name, 'files':[]}
+            if supplier_col:
+                # 供应商信息保留在记录中，仍以商品或记录列作为附件的归属边界。
+                suppliers = {" ".join(sheet.cell(r, supplier_col).text.split()) for r in rows} - {""}
+                if len(suppliers) == 1:
+                    rec["supplier"] = suppliers.pop()
+                elif suppliers:
+                    rec["supplier_conflict"] = True
+                    report["warnings"].append(f"supplier_conflict:sheet{si}:row{origin}")
             for row in rows:
                 for col, label in cols.items():
                     if (row,col) in ambiguous: continue
