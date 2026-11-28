@@ -46,6 +46,22 @@ if (mode === 'ambiguous-grid') {
     document.querySelector('main tbody').insertAdjacentHTML(
         'afterbegin', '<tr><td colspan="2">混合内容' + button(first) + '</td></tr>');
 }
+if (['order-sections', 'mixed-headers', 'section-action'].includes(mode)) {
+    const select = mode === 'mixed-headers' ? '<td>全选</td>' : '<th>商品信息</th>';
+    const section = '<tr><td colspan="6">线下单号：合成示例　日期：合成日期　待签收</td></tr>';
+    document.querySelector('main').innerHTML =
+        '<table style="width:100%"><thead><tr>' + select + '<th>订单金额</th><th>订单归属</th>' +
+        '<th>供应商</th><th>操作</th></tr></thead>' +
+        '<tbody>' + section +
+        '<tr><td>合成商品<br>另一个商品</td><td>合成金额</td><td>合成课题组</td><td>' + first +
+        '</td><td>' + button(first) + '<a>查看详情</a></td></tr></tbody>' +
+        '<tbody>' + section +
+        '<tr><td>合成商品</td><td>合成金额</td><td>合成课题组</td><td>' + second +
+        '</td><td>' + button(second) + '<a>查看详情</a></td></tr></tbody></table>';
+    if (mode === 'section-action') {
+        document.querySelector('tbody tr td').insertAdjacentHTML('beforeend', button(first));
+    }
+}
 function openReceipt(supplier) {
     events.push(['open', supplier]);
     const box = document.createElement('div');
@@ -197,6 +213,22 @@ class ReceiptBrowserTests(unittest.TestCase):
 
     def test_action_with_supplier_spread_across_columns_stops_scan(self):
         browser = self.start("ambiguous-grid")
+        with self.assertRaisesRegex(receipt.OrderListStopped, "供应商.*跨列"):
+            browser.scan()
+        self.assertEqual(self.events(), [])
+
+    def test_order_sections_may_span_more_columns_than_header(self):
+        for mode in ('order-sections', 'mixed-headers'):
+            with self.subTest(mode=mode), redirect_stdout(StringIO()):
+                browser = self.start(mode)
+                self.execute(browser)
+                self.assertEqual(self.events()[0], ["open", SUPPLIER])
+                self.assertEqual(self.events()[-1], ["finish", SUPPLIER])
+                uploaded = [name for event in self.events() if event[0] == "upload" for name in event[2]]
+                self.assertCountEqual(uploaded, self.plan.names)
+
+    def test_receipt_button_in_section_is_not_assigned_to_next_supplier(self):
+        browser = self.start("section-action")
         with self.assertRaisesRegex(receipt.OrderListStopped, "供应商.*跨列"):
             browser.scan()
         self.assertEqual(self.events(), [])

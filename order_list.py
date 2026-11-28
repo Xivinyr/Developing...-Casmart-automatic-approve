@@ -71,13 +71,19 @@ const visible = e => hasLayout(e) && getComputedStyle(e).visibility !== 'hidden'
 const readGrid = (container, allowMerges) => {
     const parts = container.matches('table') ? [container] : [...container.querySelectorAll('table')]
         .filter(part => !container.contains(part.parentElement.closest('table')));
-    const headers = parts.flatMap(part => [...part.querySelectorAll('thead th')]
-        .filter(cell => cell.closest('table') === part && (allowMerges ? hasLayout(cell) : visible(cell))));
+    const headers = parts.flatMap(part => [...part.querySelectorAll('thead tr')]
+        .filter(row => row.closest('table') === part).flatMap(row => [...row.cells]
+            .filter(cell => (allowMerges || cell.tagName === 'TH') &&
+                (allowMerges ? hasLayout(cell) : visible(cell)))));
+    const headerLeft = Math.min(...headers.map(cell => cell.getBoundingClientRect().left));
+    const headerRight = Math.max(...headers.map(cell => cell.getBoundingClientRect().right));
     const bodies = parts.flatMap(part => [...part.tBodies]);
     const rows = bodies.flatMap((body, group) => [...body.rows]
         .filter(row => allowMerges ? hasLayout(row) : visible(row)).map(row => {
             const cells = [...row.cells].filter(cell =>
                 allowMerges ? hasLayout(cell) : cell.tagName === 'TD');
+            const single = cells.length === 1 ? cells[0] : null;
+            const bounds = single?.getBoundingClientRect();
             return {
                 row,
                 cells: cells.map(cell => allowMerges && !visible(cell) ? '' : cell.innerText.trim()),
@@ -85,6 +91,9 @@ const readGrid = (container, allowMerges) => {
                 group,
                 visible: visible(row),
                 merged: cells.some(cell => cell.colSpan !== 1 || cell.rowSpan !== 1),
+                // 订单抬头占满整行，网页可能给它设置比明细表头更大的 colspan。
+                section: !!(allowMerges && single && single.rowSpan === 1 && single.colSpan > 1 &&
+                    bounds.left <= headerLeft + 1 && bounds.right >= headerRight - 1),
             };
         }));
     return {
@@ -117,7 +126,7 @@ LOADING = ".el-loading-mask,.el-loading-spinner,.ant-spin-spinning,[aria-busy='t
 PAGERS = ".el-pagination,.ant-pagination,.layui-laypage"
 
 
-def aligned_rows(entries, width, *, allow_merges=False, name_columns=()):
+def aligned_rows(entries, width, *, allow_merges=False, name_columns=(), allow_sections=False):
     """按表头展开合并格。跨列的名称记为 None，按钮仍归实际所在行。"""
     group_ends = {entry["group"]: i for i, entry in enumerate(entries)}
     pending = {}
@@ -132,6 +141,11 @@ def aligned_rows(entries, width, *, allow_merges=False, name_columns=()):
         if pending and entry["group"] != group:
             raise OrderListStopped("合并行跨越了多个表体。")
         group = entry["group"]
+        if allow_sections and entry["section"]:
+            if pending:
+                raise OrderListStopped("订单信息行与明细合并格交叠，无法核对。")
+            yield entry, tuple(None if index in name_columns else "" for index in range(width))
+            continue
         if allow_merges and (entry["merged"] or pending):
             visual = {column: value for column, (value, _last) in pending.items()}
             pending = {column: item for column, item in pending.items() if item[1] > number}
@@ -142,7 +156,8 @@ def aligned_rows(entries, width, *, allow_merges=False, name_columns=()):
                 end = column + horizontal
                 if end > width or any(index in visual for index in range(column, end)):
                     raise OrderListStopped(
-                        f"表格第 {number + 1} 行第 {column + 1} 列的合并格无法对齐（跨 {horizontal} 列）。")
+                        f"表格第 {number + 1} 行第 {column + 1} 列的合并格无法对齐"
+                        f"（跨 {horizontal} 列，表头有 {width} 列）。")
                 # rowspan=0 覆盖当前表体的剩余行。纵向合并只在当前表体内生效。
                 last = group_ends[group]
                 if vertical > 0:
@@ -222,7 +237,7 @@ class OrderListBrowser:
         rows, rendered = [], []
         name_columns = {index for index in (supplier_index, product_index) if index is not None}
         for entry, cells in aligned_rows(table["rows"], len(headers), allow_merges=self.require_supplier,
-                                         name_columns=name_columns):
+                                         name_columns=name_columns, allow_sections=self.require_supplier):
             buttons = self.actions(entry["row"], self.row_labels)
             if len(buttons) > 1:
                 raise OrderListStopped(f"同一订单行存在多个{self.operation}入口。")
@@ -234,6 +249,8 @@ class OrderListBrowser:
                 if not self.driver.execute_script(
                         "return arguments[1].closest('tr') === arguments[0];", entry["row"], buttons[0]):
                     raise OrderListStopped("签收按钮位于嵌套表格中，无法核对按钮归属。")
+            if self.require_supplier and entry["section"]:
+                continue
             order = Order(headers, tuple(value or "" for value in cells), product or "", bool(buttons),
                           supplier=supplier or "")
             rows.append((order, buttons[0] if buttons else None))
