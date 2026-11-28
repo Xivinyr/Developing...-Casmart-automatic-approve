@@ -9,12 +9,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
 import songshen as shared
-from attachments.core import SUPPLIER_HEADERS
+from attachments.core import PRODUCT_HEADERS as PRODUCT_COLUMNS, SUPPLIER_HEADERS
 
 
 PROJECT = Path(__file__).resolve().parent
-PRODUCT_COLUMNS = frozenset({"商品", "商品名", "商品名称", "采购商品", "采购商品名称", "品名",
-                             "物品名称", "货品名称"})
 LIST_COLUMNS = PRODUCT_COLUMNS | {"操作", "状态", "单据状态", "采购状态"}
 IGNORED_COLUMNS = {"序号", "行号", "#", "单据编号", "单据号", "订单号", "订单编号", "采购单号",
                    "采购单据编号", "线下单据编号", "线下采购单据编号"}

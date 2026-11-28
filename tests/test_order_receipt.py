@@ -66,12 +66,14 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(ReceiptStopped, "附件路径"):
             build_plan(self.path, report, "错误的文件夹名")
 
-    def test_duplicate_supplier_buttons_are_skipped(self):
-        ready, skipped = receipt.supplier_choices(
-            [web_row(SUPPLIER), web_row(SUPPLIER), web_row(OTHER_SUPPLIER), web_row(OTHER_SUPPLIER, False), web_row("")])
-        self.assertEqual([row.supplier for row in ready], [OTHER_SUPPLIER])
-        self.assertIn("多个", skipped[0][1])
-        self.assertIn("没有", skipped[-1][1])
+    def test_supplier_plan_collects_every_record_and_keeps_other_suppliers_out(self):
+        path, report = synthetic_manifest(self.root, suppliers=(SUPPLIER, OTHER_SUPPLIER))
+        plan = build_supplier_plan(path, report, SUPPLIER)
+        self.assertEqual([item.product for item in plan.products], [PRODUCT])
+        self.assertTrue(all(item.supplier == SUPPLIER for item in plan.products))
+        report["records"][1]["supplier"] = SUPPLIER
+        plan = build_supplier_plan(path, report, SUPPLIER)
+        self.assertEqual([item.product for item in plan.products], [PRODUCT, OTHER])
 
     def test_untagged_duplicate_products_are_refused(self):
         path, report = synthetic_manifest(self.root, second=PRODUCT)
@@ -145,19 +147,15 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(ReceiptStopped, "分类不明确"):
             receipt.upload_groups(slots, self.plan.files)
 
-    def test_form_reads_explicit_products_and_verifies_supplier_when_shown(self):
-        for text, expected in (
-            (f"签收\n供应商：{SUPPLIER}\n商品名称：{PRODUCT}\n采购商品\n{OTHER}\n材料", (PRODUCT, OTHER)),
-            (f"备注 {PRODUCT}", ()),
-        ):
-            form = dict(products=[], suppliers=[], productTables=[], text=text, incomplete=False)
-            self.assertEqual(receipt.form_products(form, SUPPLIER), expected)
-        form.update(suppliers=[OTHER_SUPPLIER], products=[PRODUCT])
-        with self.assertRaisesRegex(ReceiptStopped, "供应商.*不一致"):
-            receipt.form_products(form, SUPPLIER)
-        form.update(suppliers=[SUPPLIER], incomplete=True)
-        with self.assertRaisesRegex(ReceiptStopped, "完整商品"):
-            receipt.form_products(form, SUPPLIER)
+    def test_form_reads_supplier_without_product_table(self):
+        for text in (f"签收\n供应商：{SUPPLIER}\n上传附件", f"供应商名称\n{SUPPLIER}"):
+            self.assertEqual(receipt.form_supplier(dict(suppliers=[], text=text)), SUPPLIER)
+        self.assertEqual(receipt.form_supplier(dict(suppliers=[], text="上传附件")), "")
+        form = dict(suppliers=[SUPPLIER, OTHER_SUPPLIER], text="")
+        with self.assertRaisesRegex(ReceiptStopped, "多个供应商"):
+            receipt.form_supplier(form)
+        form = dict(suppliers=[], text=f"签收单：{SUPPLIER}\n上传附件")
+        self.assertEqual(receipt.form_supplier(form, known_suppliers=[SUPPLIER, OTHER_SUPPLIER]), SUPPLIER)
 
     def test_upload_feedback_requires_each_exact_filename_and_success_status(self):
         done = [dict(name=name, status="success") for name in self.plan.names]
@@ -169,21 +167,22 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(ReceiptStopped, "上传失败"):
             receipt.uploads_complete(done, self.plan.names)
 
-    def test_lookup_rejects_new_duplicate_after_preview(self):
-        browser = receipt.ReceiptBrowser(Mock(current_window_handle="synthetic"))
-        order = web_row(SUPPLIER)
-        with patch.object(browser, "scan", return_value=(order, order)):
-            with self.assertRaisesRegex(ReceiptStopped, "唯一"):
-                browser.find_supplier(order)
+    def test_supplier_group_requires_explicit_supplier_metadata(self):
+        with self.assertRaisesRegex(ReceiptStopped, "补齐供应商"):
+            build_supplier_plan(self.path, self.report, SUPPLIER)
+        path, report = synthetic_manifest(self.root, second=PRODUCT, suppliers=(SUPPLIER, SUPPLIER))
+        self.assertEqual(len(build_supplier_plan(path, report, SUPPLIER).products), 2)
 
     def test_cancel_before_upload_and_after_upload_is_respected(self):
         for consent, upload_count in (([False], 0), ([True, False], 1)):
             with self.subTest(consent=consent), redirect_stdout(StringIO()):
                 browser = Mock()
                 order = web_row(SUPPLIER)
-                browser.find_supplier.return_value = order
-                browser.inspect_products.return_value = (PRODUCT, OTHER)
-                receipt.run_receipt(browser, order, self.path, self.report, confirm_action=Mock(side_effect=consent))
+                browser.first_entry.return_value = order
+                browser.inspect_supplier.return_value = SUPPLIER
+                for record in self.report["records"]:
+                    record["supplier"] = SUPPLIER
+                receipt.run_receipt(browser, self.path, self.report, confirm_action=Mock(side_effect=consent))
                 self.assertEqual(browser.upload.call_count, upload_count)
                 browser.finish.assert_not_called()
 

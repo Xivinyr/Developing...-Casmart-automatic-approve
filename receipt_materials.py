@@ -147,7 +147,11 @@ def build_plan(manifest, report, product, groups=None, *, supplier=None):
                 raise ReceiptStopped("同名商品的文件夹属于其他供应商。")
     if len(selected) != 1:
         raise ReceiptStopped("分类批次有同名商品文件夹，请先核对。")
-    record = selected[0]
+    return build_record_plan(manifest, report, selected[0])
+
+
+def build_record_plan(manifest, report, record):
+    """按清单中的一条商品记录核对目录和材料，保留同供应商的同名条目。"""
     if record.get("supplier_conflict"):
         raise ReceiptStopped("分类记录跨多个供应商，无法确认附件归属。")
     sheet, row = record.get("sheet_index"), record.get("row")
@@ -176,19 +180,25 @@ def build_plan(manifest, report, product, groups=None, *, supplier=None):
     return ReceiptPlan(folders.pop(), name, files, len(report.get("warnings", [])), record_supplier(record))
 
 
-def build_supplier_plan(manifest, report, supplier, products):
+def build_supplier_plan(manifest, report, supplier, products=None):
     """完整核对这张合并签收单的所有商品后，再汇总要上传的材料。"""
-    if not products or any(not product_key(name) for name in products):
+    if products is None:
+        records = [record for record in report["records"] if record_supplier(record) == product_key(supplier)]
+        if not records:
+            raise ReceiptStopped("分类清单没有该供应商的商品。请先用原采购表补齐供应商字段。")
+        matched = [build_record_plan(manifest, report, record) for record in records]
+    elif not products or any(not product_key(name) for name in products):
         raise ReceiptStopped("签收单没有完整的商品名称。")
-    if len({product_key(name) for name in products}) != len(products):
-        raise ReceiptStopped("该供应商签收页有同名商品，无法分清每个商品对应的文件夹。")
-    groups = catalog(report)
-    matched = []
-    for name in products:
-        try:
-            matched.append(build_plan(manifest, report, name, groups, supplier=supplier))
-        except ReceiptStopped as exc:
-            raise ReceiptStopped(f"商品「{name}」无法匹配材料。{exc}") from exc
+    else:
+        if len({product_key(name) for name in products}) != len(products):
+            raise ReceiptStopped("该供应商签收页有同名商品，无法分清每个商品对应的文件夹。")
+        groups = catalog(report)
+        matched = []
+        for name in products:
+            try:
+                matched.append(build_plan(manifest, report, name, groups, supplier=supplier))
+            except ReceiptStopped as exc:
+                raise ReceiptStopped(f"商品「{name}」无法匹配材料。{exc}") from exc
     files = {}
     for item in matched:
         for file in item.files:

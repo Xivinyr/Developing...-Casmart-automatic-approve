@@ -1,8 +1,9 @@
-"""按供应商进入整张签收单，按组内商品核对附件。"""
+"""先打开签收入口，再按表单供应商汇总清单中的商品附件。"""
 import argparse
-from collections import Counter
+from dataclasses import replace
 import re
 import sys
+import time
 import tkinter as tk
 from tkinter import filedialog
 from urllib.parse import urlsplit
@@ -12,8 +13,9 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
 import songshen as shared
-from order_list import (OrderListBrowser, OrderListStopped, PRODUCT_COLUMNS, PROJECT, READ_TABLE_GRID, SUPPLIER_HEADERS,
-                        aligned_rows, product_key)
+from order_list import (MAX_SCAN_PAGES, LOADING, PAGERS, READ_SCOPE, Order, Page, OrderListBrowser,
+                        OrderListStopped, PROJECT, SUPPLIER_HEADERS, product_key)
+from attachments.suppliers import enrich_manifest
 from receipt_materials import (REQUIRED, ReceiptStopped, accepts_file, build_plan, build_supplier_plan,
                               catalog, load_manifest, record_supplier)
 
@@ -23,8 +25,9 @@ FINAL_LABELS = ("签收", "确认签收", "提交签收")
 UPLOAD_WAIT = 90
 
 # 仅从有明确签收操作的可见表单读取上传状态。file input 本身可以由上传组件隐藏。
-READ_RECEIPT_FORM = READ_TABLE_GRID + r"""
-const [labels, fullPage, productLabels, supplierLabels] = arguments;
+READ_RECEIPT_FORM = r"""
+const [labels, fullPage, supplierLabels] = arguments;
+const visible = e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
 const buttonSelector = 'button,a,[role="button"],.el-button,.ant-btn,.layui-btn,[onclick]';
 const dialogSelector = 'dialog,[role="dialog"],.el-dialog,.ant-modal,.layui-layer-dialog,.layui-layer-page';
 if (document.readyState !== 'complete') return [];
@@ -56,65 +59,40 @@ for (const root of roots) {
             // 表单显式指向站外时，不把材料交给该控件。
             targetOK: !input.form || new URL(input.form.action, location.href).origin === location.origin};
     });
-    const tableSelector = '.el-table,.ant-table,table';
     const isHeader = (label, titles) => titles.includes(label.replace(/[\s：:]/g, ''));
-    const products = [];
     const suppliers = [];
-    const productTables = [];
-    let incomplete = [...root.querySelectorAll('.el-pagination,.ant-pagination,.layui-laypage,' +
-        '.el-table-v2,.ant-table-tbody-virtual,.rc-virtual-list,.vue-recycle-scroller,' +
-        '.virtual-scroller,.virtual-list,[data-virtualized="true"]')].some(visible) ||
-        [...root.querySelectorAll(buttonSelector)].some(e =>
-            visible(e) && ['上一页','下一页','上页','下页'].includes((e.innerText || '').replace(/\s/g, '')));
-    for (const table of root.querySelectorAll(tableSelector)) {
-        const parent = table.parentElement.closest(tableSelector);
-        if (!visible(table) || parent && root.contains(parent)) continue;
-        const grid = readGrid(table, true);
-        const goods = grid.headers.flatMap((name, i) => isHeader(name, productLabels) ? [i] : []);
-        if (!goods.length) continue;
-        if (goods.length !== 1 || grid.complex) {
-            incomplete = true;
-            continue;
-        }
-        const vendors = grid.headers.flatMap((name, i) => isHeader(name, supplierLabels) ? [i] : []);
-        productTables.push({width: grid.headers.length, product: goods[0], vendors, rows: grid.rows});
+    // 读取明确标注的供应商字段。商品表的列数和合并方式不参与附件归属判断。
+    for (const label of root.querySelectorAll('label,td,th,dt,span,.el-form-item__label,.ant-form-item-label')) {
+        if (!visible(label) || label.closest('thead') || !isHeader(label.innerText, supplierLabels)) continue;
+        const field = label.closest('.el-form-item,.ant-form-item,.layui-form-item');
+        const content = field?.querySelector('.el-form-item__content,.ant-form-item-control,.layui-input-block');
+        const value = label.control || content || label.nextElementSibling;
+        if (value && visible(value)) suppliers.push(value.value || value.innerText || '');
     }
-    for (const label of root.querySelectorAll('label')) {
-        if (label.control?.type !== 'text' || !visible(label.control)) continue;
-        if (!productTables.length && isHeader(label.innerText, productLabels)) products.push(label.control.value);
-        if (isHeader(label.innerText, supplierLabels)) suppliers.push(label.control.value);
-    }
-    forms.push({root, text: root.innerText, products, suppliers, buttons, inputs, files,
-        productTables, incomplete: incomplete || productTables.length > 1});
+    forms.push({root, text: root.innerText, suppliers, buttons, inputs, files});
 }
 return forms;
 """
 
 
-def labelled_names(text, labels):
+def labelled_names(text, labels, *, require_colon=False):
     pattern = r"(?:^|\n)[ \t]*(?:" + "|".join(map(re.escape, sorted(labels, key=len, reverse=True)))
-    pattern += r")[ \t]*(?:[:：][ \t]*|\n[ \t]*|\t)([^\n\t]+)"
+    separator = r"[:：][ \t]*" if require_colon else r"(?:[:：][ \t]*|\n[ \t]*|\t)"
+    pattern += r")[ \t]*" + separator + r"([^\n\t]+)"
     return re.findall(pattern, text)
 
 
-def form_products(form, supplier, product_labels=PRODUCT_COLUMNS, supplier_labels=SUPPLIER_HEADERS):
-    if form["incomplete"]:
-        raise ReceiptStopped("签收页有分页或商品表结构不清，无法核对完整商品清单。")
-    vendors, products = list(form["suppliers"]), list(form["products"])
-    for table in form["productTables"]:
-        product_index = table["product"]
-        name_columns = {product_index, *table["vendors"]}
-        for _entry, cells in aligned_rows(table["rows"], table["width"], allow_merges=True, name_columns=name_columns):
-            if any(cells[index] is None for index in name_columns):
-                raise ReceiptStopped("签收明细的商品或供应商名称跨列合并，无法逐项核对。")
-            products.append(cells[product_index])
-            vendors.extend(cells[index] for index in table["vendors"])
-    shown = {product_key(name) for name in (vendors or labelled_names(form["text"], supplier_labels)) if name.strip()}
-    if shown and shown != {product_key(supplier)}:
-        raise ReceiptStopped("签收表单上的供应商与所选供应商不一致。")
-    if not products and not form["productTables"]:
-        products = labelled_names(form["text"], product_labels)
-    return tuple(product_key(name) for name in products)
+def form_supplier(form, supplier_labels=SUPPLIER_HEADERS, known_suppliers=()):
+    values = form["suppliers"] or labelled_names(form["text"], supplier_labels, require_colon=True)
+    if not values and known_suppliers:
+        text = product_key(form["text"])
+        values = [name for name in known_suppliers if product_key(name) in text]
+    if not values:
+        values = labelled_names(form["text"], supplier_labels)
+    shown = {product_key(value) for value in values if value.strip()}
+    if len(shown) > 1:
+        raise ReceiptStopped("签收表单出现多个供应商名称，请先核对。")
+    return next(iter(shown), "")
 
 
 def uploads_complete(rows, names):
@@ -148,24 +126,87 @@ def upload_groups(slots, files):
 
 
 class ReceiptBrowser(OrderListBrowser):
-    """同一张合并单以供应商定位，再核对完整商品清单。"""
+    """直接定位签收入口，进入表单后读取供应商。"""
     row_labels = ROW_LABELS
     operation = "签收"
-    require_supplier = True
+    require_supplier = False
 
-    def __init__(self, driver, product_column=None, timeout=shared.WAIT_TIME, *, supplier_column=None):
+    def __init__(self, driver, product_column=None, timeout=shared.WAIT_TIME, *, supplier_column=None, supplier_names=()):
         super().__init__(driver, product_column, timeout, supplier_column=supplier_column)
         self.open_url = None
+        self.supplier_names = tuple(supplier_names)
 
-    def find_supplier(self, previous):
-        matches = [order for order in self.scan()
-                   if order.actionable and product_key(order.supplier) == product_key(previous.supplier)]
-        if len(matches) != 1:
-            raise ReceiptStopped("所选供应商未能唯一对应到一个可用的签收入口。")
-        order = matches[0]
-        if order.fingerprint != previous.fingerprint:
-            raise ReceiptStopped("单据内容在预览后已变化，请重新核对。")
-        return order
+    def read_page_once(self):
+        self.guard()
+        scopes, candidates = [], []
+        for path in self.contexts():
+            driver = self.driver
+            if (driver.execute_script("return document.readyState") != "complete"
+                    or shared.find_visible_elements(driver, By.CSS_SELECTOR, LOADING)):
+                return None
+            scopes.append((path, driver.execute_script(READ_SCOPE)))
+            buttons = self.actions(driver.find_element(By.TAG_NAME, "body"), self.row_labels)
+            pagers = shared.find_visible_elements(driver, By.CSS_SELECTOR, PAGERS)
+            if len(pagers) > 1:
+                raise ReceiptStopped("存在多个分页控件，请先核对采购列表。")
+            if not buttons and not pagers:
+                continue
+            rows = []
+            for button in buttons:
+                # 只保存按钮周围的可见内容以核对刷新，无需展开表格的任何列。
+                text = driver.execute_script(
+                    "return (arguments[0].closest('tr,[role=row]') || arguments[0].parentElement).innerText", button)
+                order = Order(("签收入口",), (text,), "", True)
+                rows.append((order, button))
+            pager = pagers[0] if pagers else None
+            marker = "|".join(element.text for element in pager.find_elements(By.CSS_SELECTOR,
+                ".el-pager .active,.el-pager .is-active,.ant-pagination-item-active,.layui-laypage-curr")) if pager else ""
+            rendered = tuple((row.id, row.text) for row in driver.find_elements(By.CSS_SELECTOR, "tbody tr,[role=row]")
+                             if row.is_displayed())
+            candidates.append((path, Page(tuple(rows), pager, marker, rendered)))
+        if len(candidates) > 1:
+            raise ReceiptStopped("多个页面区域都有签收入口或分页，请先核对。")
+        path, page = candidates[0] if candidates else ((), Page((), None, "", ()))
+        scope = tuple(scopes), path
+        if self.scope is not None and scope != self.scope:
+            raise ReceiptStopped("筛选或分页范围发生变化，请重新运行签收。")
+        self.scope = scope
+        self.enter(path)
+        if not page.pager and self.driver.execute_script(r"""
+            return [...document.querySelectorAll('button,a,[role=button]')].some(element =>
+                element.getClientRects().length &&
+                ['上一页','下一页','上页','下页'].includes(element.innerText.replace(/\s/g, '')));
+        """):
+            raise ReceiptStopped("分页控件无法识别，请先核对列表。")
+        return page
+
+    def page(self, changed=None):
+        previous, since = None, None
+
+        def stable():
+            nonlocal previous, since
+            current = self.read_page_once()
+            if current is None or changed is not None and not changed(current):
+                previous, since = None, None
+                return False
+            key = current.content, current.marker, current.rendered
+            now = time.monotonic()
+            if key != previous:
+                previous, since = key, now
+            seconds = shared.APPROVAL_LIST_STABLE_SECONDS if current.rows else shared.APPROVAL_EMPTY_RECHECK_SECONDS
+            return current if now - since >= seconds else False
+
+        return self.wait(stable, "签收入口或分页未稳定，请核对页面加载状态。")
+
+    def first_entry(self):
+        page = self.first_page()
+        for number in range(1, MAX_SCAN_PAGES + 1):
+            if page.rows:
+                return replace(page.rows[0][0], page=number, position=1)
+            page = self.move("next", page)
+            if page is None:
+                return None
+        raise ReceiptStopped("超过扫描页数，未确认可用的签收入口。")
 
     def guard_receipt(self):
         d = self.driver
@@ -179,25 +220,26 @@ class ReceiptBrowser(OrderListBrowser):
                 or url.port not in (None, 443) or url.username is not None):
             raise ReceiptStopped("已离开 Casmart 会员中心，停止签收。")
 
-    def read_form(self, supplier):
+    def read_form(self, supplier=None):
         self.guard_receipt()
         forms = []
-        products = PRODUCT_COLUMNS | ({self.product_column} if self.product_column else set())
         suppliers = SUPPLIER_HEADERS | ({self.supplier_column} if self.supplier_column else set())
         for path in self.contexts():
             # 完整页面只有在行按钮引起页面跳转后才允许作为签收区域。
             full_page = self.driver.execute_script("return location.href") != self.open_url
             for form in self.driver.execute_script(READ_RECEIPT_FORM, FINAL_LABELS, full_page,
-                                                   sorted(products), sorted(suppliers)):
+                                                   sorted(suppliers)):
                 forms.append((path, form))
         if len(forms) > 1:
             raise ReceiptStopped("页面上有多个可能的签收表单，无法唯一定位。")
         if not forms:
             return None
         path, form = forms[0]
-        form["product_names"] = form_products(form, supplier, products, suppliers)
-        if not form["product_names"]:
+        form["supplier_name"] = form_supplier(form, suppliers, self.supplier_names)
+        if not form["supplier_name"]:
             return None
+        if supplier is not None and form["supplier_name"] != product_key(supplier):
+            raise ReceiptStopped("签收表单上的供应商在核对后发生变化。")
         if len(form["buttons"]) != 1:
             raise ReceiptStopped("签收表单的最终签收按钮不唯一，请先核对页面。")
         # 原生上传可以对隐藏 input 工作，因此也确认没有其他弹窗挡在表单上面。
@@ -221,26 +263,22 @@ class ReceiptBrowser(OrderListBrowser):
         self.open_url = self.driver.execute_script("return location.href")
         self.click_once(button)
 
-    def inspect_products(self, supplier):
+    def inspect_supplier(self):
         previous = None
 
         def stable():
             nonlocal previous
-            state = self.read_form(supplier)
-            products = state[1]["product_names"] if state else None
-            if products and products == previous:
-                return products
-            previous = products
+            state = self.read_form()
+            supplier = state[1]["supplier_name"] if state else None
+            if supplier and supplier == previous:
+                return supplier
+            previous = supplier
             return False
 
-        return self.wait(stable, "未读到该供应商签收表单的商品清单，尚未上传。")
+        return self.wait(stable, "未读到签收表单的供应商名称，请检查页面。")
 
     def checked_form(self, plan):
-        state = self.read_form(plan.supplier)
-        names = [product_key(item.product) for item in plan.products]
-        if state and Counter(state[1]["product_names"]) != Counter(names):
-            raise ReceiptStopped("签收商品清单在核对后发生变化。")
-        return state
+        return self.read_form(plan.supplier)
 
     def upload(self, plan):
         _path, form = self.wait(lambda: self.checked_form(plan), "无法再次核对该供应商的签收表单。")
@@ -310,31 +348,17 @@ class ReceiptBrowser(OrderListBrowser):
         self.wait(completed, "未看到明确的签收成功提示。可能已受理，请人工核对单据状态，勿直接重试。")
 
 
-def choose_source():
+def choose_source(*, workbook=False):
     root = tk.Tk()
     root.withdraw()
     try:
+        if workbook:
+            return filedialog.askopenfilename(parent=root, title="选择含供应商列的原采购表",
+                initialdir=PROJECT / "outputs", filetypes=[("Excel 工作簿", "*.xlsx")])
         return filedialog.askdirectory(parent=root, title="选择包含 manifest.json 的分类批次文件夹",
                                        initialdir=PROJECT / "outputs", mustexist=True)
     finally:
         root.destroy()
-
-
-def supplier_choices(rows):
-    """同一个供应商的合并行可共享一个按钮。多个可用按钮时让本人核对。"""
-    counts = Counter(product_key(row.supplier) for row in rows if row.actionable)
-    ready, skipped = [], []
-    for row in rows:
-        if not row.actionable:
-            continue
-        name = product_key(row.supplier)
-        if not name:
-            skipped.append((row, "网页没有可读的供应商名称"))
-        elif counts[name] != 1:
-            skipped.append((row, "该供应商有多个可用的签收入口"))
-        else:
-            ready.append(row)
-    return ready, skipped
 
 
 def show_plan(plan):
@@ -351,27 +375,17 @@ def confirm(action, supplier):
         return False
 
 
-def choose_supplier(ready):
-    if len(ready) == 1:
-        return ready[0]
-    try:
-        answer = input("选择本次要查看的供应商序号，直接回车取消：").strip()
-        choice = int(answer)
-    except (EOFError, ValueError):
-        return None
-    return ready[choice - 1] if 1 <= choice <= len(ready) else None
-
-
-def run_receipt(browser, order, manifest, report, *, confirm_action=confirm):
-    fresh = browser.find_supplier(order)
-    browser.open_receipt(fresh)
-    products = browser.inspect_products(fresh.supplier)
-    plan = build_supplier_plan(manifest, report, fresh.supplier, products)
-    print(f"\n供应商「{plan.supplier}」的签收单有 {len(plan.products)} 个商品。")
+def run_receipt(browser, manifest, report, *, confirm_action=confirm):
+    entry = browser.first_entry()
+    if entry is None:
+        print("复查后没有可用的签收按钮。")
+        return
+    browser.open_receipt(entry)
+    supplier = browser.inspect_supplier()
+    plan = build_supplier_plan(manifest, report, supplier)
+    print(f"\n签收页供应商「{plan.supplier}」，清单匹配到 {len(plan.products)} 条商品记录。")
     for item in plan.products:
         show_plan(item)
-    if any(not item.supplier for item in plan.products):
-        print("清单未记录供应商的文件夹按商品名找出，请核对这些材料属于当前供应商。")
     warnings = plan.products[0].warnings
     if warnings:
         print(f"分类批次有 {warnings} 条格式警告，请查阅原清单。")
@@ -389,13 +403,14 @@ def run_receipt(browser, order, manifest, report, *, confirm_action=confirm):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="按供应商选择签收单，按组内商品匹配分类文件夹")
+    parser = argparse.ArgumentParser(description="先打开签收入口，再按供应商汇总分类附件")
     parser.add_argument("--folder", "--manifest", dest="source", help="分类批次文件夹或其中的 manifest.json")
-    parser.add_argument("--supplier-column", help="网页供应商名称列，默认识别常用供应商表头")
-    parser.add_argument("--product-column", help="签收明细的商品名称列，默认识别常用商品表头")
+    parser.add_argument("--supplier-source", help="含供应商列的原采购表 XLSX，用于补齐清单")
+    parser.add_argument("--supplier-column", help="签收页的供应商字段名，默认识别常用名称")
+    parser.add_argument("--product-column", help=argparse.SUPPRESS)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--check-list", action="store_true", help="登录，只读预览供应商和签收入口")
-    mode.add_argument("--execute", action="store_true", help="选择供应商并核对商品材料，确认后上传及签收")
+    mode.add_argument("--check-list", action="store_true", help="登录，只读预览可用签收按钮")
+    mode.add_argument("--execute", action="store_true", help="打开签收页并匹配供应商附件，确认后上传及签收")
     parser.add_argument("--via-casmart", action="store_true", help="从商城入口登录")
     parser.add_argument("--wait-on-exit", action="store_true", help="保留任务窗口，回车关闭")
     args = parser.parse_args(argv)
@@ -404,6 +419,21 @@ def main(argv=None):
         if not source:
             return 0
         manifest, report = load_manifest(source)
+        supplier_source = args.supplier_source
+        if args.execute and not supplier_source and not any(record_supplier(record) for record in report["records"]):
+            print("清单有商品尚未记录供应商，请选择含供应商名称列的原采购表。")
+            supplier_source = choose_source(workbook=True)
+            if not supplier_source:
+                return 0
+        if supplier_source:
+            try:
+                report, count = enrich_manifest(manifest, supplier_source)
+            except (OSError, ValueError) as exc:
+                raise ReceiptStopped(f"补齐清单供应商失败。{exc}") from exc
+            print(f"已将 {count} 条供应商信息写入清单，补齐前版本保存在同目录。")
+        missing_suppliers = sum(not record_supplier(record) for record in report["records"])
+        if missing_suppliers:
+            print(f"另有 {missing_suppliers} 条商品尚未确认供应商，请核对原采购表。")
         groups = catalog(report)
         if not groups:
             raise ReceiptStopped("分类批次没有可按名称匹配的商品。")
@@ -427,18 +457,16 @@ def main(argv=None):
         driver.get(start)
         if not shared.auto_login_if_needed(driver, accounts) or not shared.ensure_target_page(driver):
             raise ReceiptStopped("未完成登录或进入采购单据列表。")
-        browser = ReceiptBrowser(driver, args.product_column, supplier_column=args.supplier_column)
-        print("正在读取当前筛选中的供应商及签收入口。")
-        ready, skipped = supplier_choices(browser.scan())
-        for row, reason in skipped:
-            print(f"[跳过] 第 {row.page} 页第 {row.position} 行 {row.supplier}：{reason}")
-        for index, row in enumerate(ready, 1):
-            print(f"{index}. {row.supplier}（第 {row.page} 页第 {row.position} 行）")
-        print(f"可选择 {len(ready)} 家供应商，待核对 {len(skipped)} 个入口。")
-        if args.execute and ready:
-            selection = choose_supplier(ready)
-            if selection:
-                run_receipt(browser, selection, manifest, report)
+        browser = ReceiptBrowser(driver, supplier_column=args.supplier_column,
+                                 supplier_names={record_supplier(record) for record in report["records"] if record_supplier(record)})
+        print("正在查找可用的签收按钮。")
+        if args.execute:
+            run_receipt(browser, manifest, report)
+        else:
+            ready = browser.scan()
+            for index, row in enumerate(ready, 1):
+                print(f"{index}. 第 {row.page} 页第 {row.position} 个签收入口")
+            print(f"共找到 {len(ready)} 个可用签收入口。")
         return 0
     except (ReceiptStopped, OrderListStopped) as exc:
         print(f"签收任务停止：{exc}")

@@ -6,7 +6,9 @@ import json
 import os
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+from attachments.core import Cell, Sheet
+from attachments.suppliers import with_suppliers
 
 from selenium import webdriver
 from selenium.webdriver.edge.service import Service
@@ -62,6 +64,28 @@ if (['order-sections', 'mixed-headers', 'section-action'].includes(mode)) {
         document.querySelector('tbody tr td').insertAdjacentHTML('beforeend', button(first));
     }
 }
+if (mode === 'button-only' || mode === 'supplier-only' || mode === 'delayed') {
+    document.querySelector('main').innerHTML = '<div><button disabled>签收</button>' +
+        (mode === 'delayed' ? '' : button(first)) + '</div>';
+    if (mode === 'delayed') {
+        setTimeout(() => document.querySelector('main div').insertAdjacentHTML('beforeend', button(first)), 500);
+    }
+}
+if (mode === 'next-page') {
+    document.querySelector('main').innerHTML =
+        '<div id="entries"></div><div class="el-pagination"><button class="btn-prev">上一页</button>' +
+        '<ul class="el-pager"><li class="active">1</li></ul><button class="btn-next">下一页</button></div>';
+    const showPage = page => {
+        document.querySelector('#entries').innerHTML = page === 1 ?
+            '<table><tbody><tr><td colspan="6">已签收</td></tr></tbody></table>' : button(first);
+        document.querySelector('.active').textContent = page;
+        document.querySelector('.btn-prev').disabled = page === 1;
+        document.querySelector('.btn-next').disabled = page === 2;
+    };
+    document.querySelector('.btn-prev').onclick = () => showPage(1);
+    document.querySelector('.btn-next').onclick = () => showPage(2);
+    showPage(1);
+}
 function openReceipt(supplier) {
     events.push(['open', supplier]);
     const box = document.createElement('div');
@@ -83,6 +107,8 @@ function openReceipt(supplier) {
         info = '<table><thead><tr><th>商品名称</th><th>备注</th></tr></thead>' +
             '<tbody><tr><td colspan="2">合成商品</td></tr></tbody></table>';
     }
+    if (mode === 'supplier-only') info = '<p>供应商名称：' + vendor + '</p>';
+    if (mode === 'multiple-suppliers') info = '<p>供应商：' + first + '</p><p>供应商：' + second + '</p>';
     box.innerHTML = '<h2>单据签收</h2>' + info +
         '<div class="fields"></div><ul class="files"></ul><button class="final" disabled>签收</button>';
     if (mode === 'paginated') box.insertAdjacentHTML('beforeend', '<div class="el-pagination">下一页</div>');
@@ -172,16 +198,13 @@ class ReceiptBrowserTests(unittest.TestCase):
         html = "<script>const mode=" + json.dumps(mode) + ";</script>" + FIXTURE
         url = "data:text/html;charset=utf-8;base64," + base64.b64encode(html.encode()).decode("ascii")
         self.driver.get(url)
-        return FixtureBrowser(self.driver, timeout=3)
+        return FixtureBrowser(self.driver, timeout=5, supplier_names={SUPPLIER, OTHER_SUPPLIER})
 
     def events(self):
         return self.driver.execute_script("return window.events")
 
     def execute(self, browser, consent=lambda *_: True):
-        ready, _skipped = receipt.supplier_choices(browser.scan())
-        self.assertCountEqual([row.supplier for row in ready], [SUPPLIER, OTHER_SUPPLIER])
-        selection = next(row for row in ready if row.supplier == SUPPLIER)
-        receipt.run_receipt(browser, selection, self.manifest, self.report, confirm_action=consent)
+        receipt.run_receipt(browser, self.manifest, self.report, confirm_action=consent)
 
     def test_upload_all_and_confirm_same_order_for_single_and_split_forms(self):
         for mode in ("single", "split"):
@@ -199,23 +222,27 @@ class ReceiptBrowserTests(unittest.TestCase):
                         self.assertEqual(names, [file.path.name for file in self.plan.files if file.category == label])
                 self.assertIn("签收成功", output.getvalue())
 
-    def test_merged_grid_with_legacy_manifest(self):
+    def test_merged_grid_with_supplier_enriched_legacy_manifest(self):
         temp = TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         path, _report = synthetic_manifest(temp.name)
         self.manifest, self.report = load_manifest(path)
-        with redirect_stdout(StringIO()) as output:
+        sheet = Sheet("原采购表", {(1, 1): Cell("*商品名称"), (1, 11): Cell("*供应商名称"),
+            (2, 1): Cell(PRODUCT), (2, 11): Cell(SUPPLIER), (3, 1): Cell(OTHER), (3, 11): Cell(SUPPLIER)})
+        self.report, matched = with_suppliers(self.report, [sheet])
+        self.assertEqual(matched, 2)
+        with redirect_stdout(StringIO()):
             browser = self.start("merged-grid")
             self.execute(browser)
-        self.assertIn("清单未记录供应商", output.getvalue())
         self.assertEqual([event[0] for event in self.events()], ["open", "upload", "finish"])
         self.assertEqual(self.events()[-1], ["finish", SUPPLIER])
 
-    def test_action_with_supplier_spread_across_columns_stops_scan(self):
-        browser = self.start("ambiguous-grid")
-        with self.assertRaisesRegex(receipt.OrderListStopped, "供应商.*跨列"):
-            browser.scan()
-        self.assertEqual(self.events(), [])
+    def test_button_can_open_without_list_headers(self):
+        with redirect_stdout(StringIO()):
+            browser = self.start("button-only")
+            with patch.object(browser, "table_rows", side_effect=AssertionError("不应解析列表列数")):
+                self.execute(browser)
+        self.assertEqual(self.events()[-1], ["finish", SUPPLIER])
 
     def test_order_sections_may_span_more_columns_than_header(self):
         for mode in ('order-sections', 'mixed-headers'):
@@ -227,32 +254,43 @@ class ReceiptBrowserTests(unittest.TestCase):
                 uploaded = [name for event in self.events() if event[0] == "upload" for name in event[2]]
                 self.assertCountEqual(uploaded, self.plan.names)
 
-    def test_receipt_button_in_section_is_not_assigned_to_next_supplier(self):
-        browser = self.start("section-action")
-        with self.assertRaisesRegex(receipt.OrderListStopped, "供应商.*跨列"):
-            browser.scan()
-        self.assertEqual(self.events(), [])
+    def test_supplier_only_form_collects_all_its_manifest_records(self):
+        with redirect_stdout(StringIO()):
+            browser = self.start("supplier-only")
+            self.execute(browser)
+        self.assertEqual(self.events()[-1], ["finish", SUPPLIER])
 
     def test_unsafe_detail_stops_before_upload(self):
-        for mode, reason in (("wrong-supplier", "供应商.*不一致"), ("unmatched", "无材料商品"),
-                             ("paginated", "完整商品"), ("existing", "已经有附件"),
-                             ("ambiguous-detail-grid", "商品或供应商名称跨列")):
+        for mode, reason in (("wrong-supplier", "没有该供应商"), ("existing", "已经有附件"),
+                             ("multiple-suppliers", "多个供应商")):
             with self.subTest(mode=mode), redirect_stdout(StringIO()):
                 browser = self.start(mode)
                 with self.assertRaisesRegex(ReceiptStopped, reason):
                     self.execute(browser)
                 self.assertEqual(self.events(), [["open", SUPPLIER]])
 
-    def test_products_changed_after_confirmation_are_never_uploaded(self):
+    def test_supplier_changed_after_confirmation_is_never_uploaded(self):
         browser = self.start("single")
 
         def consent(*_args):
-            self.driver.execute_script("document.querySelector('.el-dialog tbody tr:last-child td').textContent = '变更商品'")
+            self.driver.execute_script("document.querySelector('.el-dialog p').textContent = '供应商：合成供应商乙'")
             return True
 
-        with redirect_stdout(StringIO()), self.assertRaisesRegex(ReceiptStopped, "清单.*变化"):
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(ReceiptStopped, "供应商.*变化"):
             self.execute(browser, consent=consent)
         self.assertEqual(self.events(), [["open", SUPPLIER]])
+
+    def test_late_button_is_waited_for_before_exiting(self):
+        with redirect_stdout(StringIO()):
+            browser = self.start("delayed")
+            self.execute(browser)
+        self.assertEqual(self.events()[-1], ["finish", SUPPLIER])
+
+    def test_first_available_button_can_be_on_later_page(self):
+        with redirect_stdout(StringIO()):
+            browser = self.start("next-page")
+            self.execute(browser)
+        self.assertEqual(self.events()[-1], ["finish", SUPPLIER])
 
     def test_upload_error_does_not_reach_final_confirmation(self):
         browser = self.start("failed")

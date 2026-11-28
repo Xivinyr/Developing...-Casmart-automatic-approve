@@ -90,6 +90,13 @@ DEFAULT = dict(header_row=1, start_row=2, end_row=None, product_column=None,
                headers={}, required=['订单截图','支付记录','发票','开箱实物图'], supplier_column=None)
 
 SUPPLIER_HEADERS = frozenset({"供应商", "供应商名称", "供货商", "供货商名称", "商家", "商家名称", "店铺", "店铺名称"})
+PRODUCT_HEADERS = frozenset({"商品", "商品名", "商品名称", "采购商品", "采购商品名称", "品名",
+                             "物品名称", "货品名称"})
+
+
+def header_label(text):
+    """原采购表用星号标记必填列，识别表头时去掉该标记。"""
+    return "".join(text.strip().lstrip("*＊").rstrip("：: ").split())
 
 
 def attachment_columns(sheet, config):
@@ -110,7 +117,7 @@ def supplier_column(sheet, config):
     if config["supplier_column"]:
         return column(config["supplier_column"])
     matches = [col for (row, col), cell in sheet.cells.items()
-               if row == config["header_row"] and "".join(cell.text.rstrip("：: ").split()) in SUPPLIER_HEADERS]
+               if row == config["header_row"] and header_label(cell.text) in SUPPLIER_HEADERS]
     return matches[0] if len(matches) == 1 else None
 
 
