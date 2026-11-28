@@ -64,26 +64,41 @@ class Page:
         return tuple(order.fingerprint for order, _button in self.rows)
 
 
-# Element UI / Ant Design 可能将表头和表体分开渲染在一个组件中。
-READ_TABLES = r"""
-const visible = e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
+# 同一个表格组件可能用不同的 HTML 表格渲染表头和表体。嵌在单元格里的表格不属于外层。
+READ_TABLE_GRID = r"""
+const hasLayout = e => e.getClientRects().length > 0;
+const visible = e => hasLayout(e) && getComputedStyle(e).visibility !== 'hidden';
+const readGrid = (container, allowMerges) => {
+    const parts = container.matches('table') ? [container] : [...container.querySelectorAll('table')]
+        .filter(part => !container.contains(part.parentElement.closest('table')));
+    const headers = parts.flatMap(part => [...part.querySelectorAll('thead th')]
+        .filter(cell => cell.closest('table') === part && (allowMerges ? hasLayout(cell) : visible(cell))));
+    const bodies = parts.flatMap(part => [...part.tBodies]);
+    const rows = bodies.flatMap((body, group) => [...body.rows]
+        .filter(row => allowMerges ? hasLayout(row) : visible(row)).map(row => {
+            const cells = [...row.cells].filter(cell =>
+                allowMerges ? hasLayout(cell) : cell.tagName === 'TD');
+            return {
+                row,
+                cells: cells.map(cell => allowMerges && !visible(cell) ? '' : cell.innerText.trim()),
+                spans: cells.map(cell => [cell.rowSpan, cell.colSpan]),
+                group,
+                visible: visible(row),
+                merged: cells.some(cell => cell.colSpan !== 1 || cell.rowSpan !== 1),
+            };
+        }));
+    return {
+        headers: headers.map(cell => visible(cell) ? cell.innerText.trim() : ''),
+        complex: headers.some(cell => cell.colSpan !== 1 || cell.rowSpan !== 1),
+        rows,
+    };
+};
+"""
+
+READ_TABLES = READ_TABLE_GRID + r"""
 const containers = [...document.querySelectorAll('.el-table,.ant-table,table')]
     .filter(e => visible(e) && !e.parentElement.closest('.el-table,.ant-table,table'));
-return containers.map(table => {
-    const headers = [...table.querySelectorAll('thead th')].filter(visible);
-    const bodies = [...table.querySelectorAll('tbody')];
-    return {
-        headers: headers.map(e => e.innerText.trim()),
-        complex: headers.some(e => e.colSpan !== 1 || e.rowSpan !== 1),
-        rows: [...table.querySelectorAll('tbody tr')].filter(visible).map(row => ({
-            row,
-            cells: [...row.children].filter(e => e.tagName === 'TD').map(e => e.innerText.trim()),
-            spans: [...row.children].filter(e => e.tagName === 'TD').map(e => [e.rowSpan, e.colSpan]),
-            group: bodies.indexOf(row.parentElement),
-            merged: [...row.children].some(e => e.colSpan !== 1 || e.rowSpan !== 1)
-        }))
-    };
-});
+return containers.map(table => readGrid(table, arguments[0]));
 """
 
 READ_SCOPE = r"""
@@ -102,44 +117,50 @@ LOADING = ".el-loading-mask,.el-loading-spinner,.ant-spin-spinning,[aria-busy='t
 PAGERS = ".el-pagination,.ant-pagination,.layui-laypage"
 
 
-def aligned_rows(entries, width, *, allow_rowspan=False):
-    """将纵向合并格的文本对齐到所属列。实际操作仍走原行。"""
+def aligned_rows(entries, width, *, allow_merges=False, name_columns=()):
+    """按表头展开合并格。跨列的名称记为 None，按钮仍归实际所在行。"""
+    group_ends = {entry["group"]: i for i, entry in enumerate(entries)}
     pending = {}
     group = None
     for number, entry in enumerate(entries):
         cells = tuple(entry["cells"])
-        if len(cells) == 1 and shared.compact_text(cells[0]) in EMPTY_LABELS:
+        if (len(cells) == 1 and shared.compact_text(cells[0]) in EMPTY_LABELS
+                and entry["spans"][0][0] == 1):
             if pending:
                 raise OrderListStopped("合并格跨越了空占位行。")
             continue
         if pending and entry["group"] != group:
             raise OrderListStopped("合并行跨越了多个表体。")
         group = entry["group"]
-        if allow_rowspan and (entry["merged"] or pending):
-            visual_cells = []
-            physical = iter(zip(cells, entry["spans"]))
-            for col in range(width):
-                if col in pending:
-                    value, last = pending[col]
-                    visual_cells.append(value)
-                    if last == number:
-                        del pending[col]
-                    continue
-                cell = next(physical, None)
-                if cell is None:
-                    break
-                value, (vertical, horizontal) = cell
-                if horizontal != 1 or vertical < 1 or number + vertical > len(entries):
-                    raise OrderListStopped("合并行的单元格结构无法核对。")
-                if vertical > 1:
-                    pending[col] = value, number + vertical - 1
-                visual_cells.append(value)
-            if next(physical, None) is not None:
-                raise OrderListStopped("合并行有无法对应的单元格。")
-            cells = tuple(visual_cells)
-        if (entry["merged"] and not allow_rowspan) or len(cells) != width:
-            raise OrderListStopped("表头与订单行不能一一对应。")
-        yield entry, cells
+        if allow_merges and (entry["merged"] or pending):
+            visual = {column: value for column, (value, _last) in pending.items()}
+            pending = {column: item for column, item in pending.items() if item[1] > number}
+            column = 0
+            for text, (vertical, horizontal) in zip(cells, entry["spans"]):
+                while column in visual:
+                    column += 1
+                end = column + horizontal
+                if end > width or any(index in visual for index in range(column, end)):
+                    raise OrderListStopped(
+                        f"表格第 {number + 1} 行第 {column + 1} 列的合并格无法对齐（跨 {horizontal} 列）。")
+                # rowspan=0 覆盖当前表体的剩余行。纵向合并只在当前表体内生效。
+                last = group_ends[group]
+                if vertical > 0:
+                    last = min(last, number + vertical - 1)
+                for index in range(column, end):
+                    value = text if index == column else ""
+                    if horizontal > 1 and index in name_columns:
+                        value = None
+                    visual[index] = value
+                    if last > number:
+                        pending[index] = (value, last)
+                column = end
+            cells = tuple(visual[index] for index in sorted(visual))
+        if (entry["merged"] and not allow_merges) or len(cells) != width:
+            raise OrderListStopped(
+                f"表格第 {number + 1} 行对齐后有 {len(cells)} 列，表头有 {width} 列，无法核对。")
+        if entry["visible"]:
+            yield entry, cells
 
 
 class OrderListBrowser:
@@ -199,13 +220,22 @@ class OrderListBrowser:
 
     def table_rows(self, table, headers, product_index, supplier_index):
         rows, rendered = [], []
-        for entry, cells in aligned_rows(table["rows"], len(headers), allow_rowspan=self.require_supplier):
+        name_columns = {index for index in (supplier_index, product_index) if index is not None}
+        for entry, cells in aligned_rows(table["rows"], len(headers), allow_merges=self.require_supplier,
+                                         name_columns=name_columns):
             buttons = self.actions(entry["row"], self.row_labels)
             if len(buttons) > 1:
                 raise OrderListStopped(f"同一订单行存在多个{self.operation}入口。")
             product = cells[product_index] if product_index is not None else ""
             supplier = cells[supplier_index] if supplier_index is not None else ""
-            order = Order(headers, cells, product, bool(buttons), supplier=supplier)
+            if self.require_supplier and buttons:
+                if supplier is None:
+                    raise OrderListStopped("带签收按钮的行把供应商跨列合并了，无法核对按钮归属。")
+                if not self.driver.execute_script(
+                        "return arguments[1].closest('tr') === arguments[0];", entry["row"], buttons[0]):
+                    raise OrderListStopped("签收按钮位于嵌套表格中，无法核对按钮归属。")
+            order = Order(headers, tuple(value or "" for value in cells), product or "", bool(buttons),
+                          supplier=supplier or "")
             rows.append((order, buttons[0] if buttons else None))
             rendered.append(entry["row"].id)
         return tuple(rows), tuple(rendered)
@@ -223,7 +253,7 @@ class OrderListBrowser:
                     ".virtual-scroller,.virtual-list,[data-virtualized='true']"):
                 raise OrderListStopped("检测到虚拟滚动列表，无法确认完整范围。")
             scopes.append((path, d.execute_script(READ_SCOPE)))
-            context_tables = d.execute_script(READ_TABLES)
+            context_tables = d.execute_script(READ_TABLES, self.require_supplier)
             for table in context_tables:
                 headers = tuple(shared.compact_text(label) for label in table["headers"])
                 product_labels = {self.product_column} if self.product_column else PRODUCT_COLUMNS

@@ -12,7 +12,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
 import songshen as shared
-from order_list import (OrderListBrowser, OrderListStopped, PRODUCT_COLUMNS, PROJECT, SUPPLIER_HEADERS,
+from order_list import (OrderListBrowser, OrderListStopped, PRODUCT_COLUMNS, PROJECT, READ_TABLE_GRID, SUPPLIER_HEADERS,
                         aligned_rows, product_key)
 from receipt_materials import (REQUIRED, ReceiptStopped, accepts_file, build_plan, build_supplier_plan,
                               catalog, load_manifest, record_supplier)
@@ -23,9 +23,8 @@ FINAL_LABELS = ("签收", "确认签收", "提交签收")
 UPLOAD_WAIT = 90
 
 # 仅从有明确签收操作的可见表单读取上传状态。file input 本身可以由上传组件隐藏。
-READ_RECEIPT_FORM = r"""
+READ_RECEIPT_FORM = READ_TABLE_GRID + r"""
 const [labels, fullPage, productLabels, supplierLabels] = arguments;
-const visible = e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
 const buttonSelector = 'button,a,[role="button"],.el-button,.ant-btn,.layui-btn,[onclick]';
 const dialogSelector = 'dialog,[role="dialog"],.el-dialog,.ant-modal,.layui-layer-dialog,.layui-layer-page';
 if (document.readyState !== 'complete') return [];
@@ -70,21 +69,15 @@ for (const root of roots) {
     for (const table of root.querySelectorAll(tableSelector)) {
         const parent = table.parentElement.closest(tableSelector);
         if (!visible(table) || parent && root.contains(parent)) continue;
-        const headers = [...table.querySelectorAll('thead th')].filter(visible);
-        const goods = headers.flatMap((cell, i) => isHeader(cell.innerText, productLabels) ? [i] : []);
+        const grid = readGrid(table, true);
+        const goods = grid.headers.flatMap((name, i) => isHeader(name, productLabels) ? [i] : []);
         if (!goods.length) continue;
-        if (goods.length !== 1 || headers.some(cell => cell.colSpan !== 1 || cell.rowSpan !== 1)) {
+        if (goods.length !== 1 || grid.complex) {
             incomplete = true;
             continue;
         }
-        const vendors = headers.flatMap((cell, i) => isHeader(cell.innerText, supplierLabels) ? [i] : []);
-        const bodies = [...table.querySelectorAll('tbody')];
-        const rows = [...table.querySelectorAll('tbody tr')].filter(visible).map(row => {
-            const cells = [...row.cells].filter(visible);
-            return {cells: cells.map(cell => cell.innerText), spans: cells.map(cell => [cell.rowSpan, cell.colSpan]),
-                merged: cells.some(cell => cell.rowSpan !== 1 || cell.colSpan !== 1), group: bodies.indexOf(row.parentElement)};
-        });
-        productTables.push({width: headers.length, product: goods[0], vendors, rows});
+        const vendors = grid.headers.flatMap((name, i) => isHeader(name, supplierLabels) ? [i] : []);
+        productTables.push({width: grid.headers.length, product: goods[0], vendors, rows: grid.rows});
     }
     for (const label of root.querySelectorAll('label')) {
         if (label.control?.type !== 'text' || !visible(label.control)) continue;
@@ -109,8 +102,12 @@ def form_products(form, supplier, product_labels=PRODUCT_COLUMNS, supplier_label
         raise ReceiptStopped("签收页有分页或商品表结构不清，无法核对完整商品清单。")
     vendors, products = list(form["suppliers"]), list(form["products"])
     for table in form["productTables"]:
-        for _entry, cells in aligned_rows(table["rows"], table["width"], allow_rowspan=True):
-            products.append(cells[table["product"]])
+        product_index = table["product"]
+        name_columns = {product_index, *table["vendors"]}
+        for _entry, cells in aligned_rows(table["rows"], table["width"], allow_merges=True, name_columns=name_columns):
+            if any(cells[index] is None for index in name_columns):
+                raise ReceiptStopped("签收明细的商品或供应商名称跨列合并，无法逐项核对。")
+            products.append(cells[product_index])
             vendors.extend(cells[index] for index in table["vendors"])
     shown = {product_key(name) for name in (vendors or labelled_names(form["text"], supplier_labels)) if name.strip()}
     if shown and shown != {product_key(supplier)}:

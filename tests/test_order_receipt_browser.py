@@ -12,7 +12,7 @@ from selenium import webdriver
 from selenium.webdriver.edge.service import Service
 
 import order_receipt as receipt
-from receipt_materials import ReceiptStopped, build_supplier_plan
+from receipt_materials import ReceiptStopped, build_supplier_plan, load_manifest
 from test_order_receipt import OTHER, OTHER_SUPPLIER, PRODUCT, SUPPLIER, synthetic_manifest
 
 
@@ -32,18 +32,41 @@ const rows = mode === 'split' ?
 document.querySelector('main').innerHTML =
     '<table><thead><tr><th>供应商名称</th>' + (mode === 'split' ? '<th>商品名称</th>' : '') +
     '<th>操作</th></tr></thead><tbody>' + rows + '</tbody></table>';
+if (mode === 'merged-grid') {
+    document.querySelector('main').innerHTML =
+        '<table><thead><tr><th>供应商名称</th><th>商品名称</th><th>金额</th><th>备注</th><th>操作</th></tr></thead>' +
+        '<tbody><tr><td colspan="5">分组抬头<table><tbody><tr><td>组内说明</td></tr></tbody></table></td></tr>' +
+        '<tr><td rowspan="0">' + first + '</td><td>合成商品</td><td colspan="2">合计</td>' +
+        '<td rowspan="5">' + button(first) + '</td></tr>' +
+        '<tr><td style="display:none"></td><td>另一个商品</td><td colspan="2">合计</td></tr></tbody>' +
+        '<tbody><tr><td>' + second + '</td><td>合成商品</td><td colspan="2">合计</td><td>' +
+        button(second) + '</td></tr></tbody></table>';
+}
+if (mode === 'ambiguous-grid') {
+    document.querySelector('main tbody').insertAdjacentHTML(
+        'afterbegin', '<tr><td colspan="2">混合内容' + button(first) + '</td></tr>');
+}
 function openReceipt(supplier) {
     events.push(['open', supplier]);
     const box = document.createElement('div');
     box.className = 'el-dialog';
     const vendor = mode === 'wrong-supplier' ? second : supplier;
     const item = mode === 'unmatched' ? '无材料商品' : '另一个商品';
-    const info = mode === 'split' ?
+    let info = mode === 'split' ?
         '<div class="el-table"><table><thead><tr><th>供应商</th><th>商品名称</th></tr></thead></table>' +
         '<table><tbody><tr><td rowspan="2">' + vendor + '</td><td>合成商品</td></tr>' +
         '<tr><td>' + item + '</td></tr></tbody></table></div>' :
         '<p>供应商：' + vendor + '</p><table><thead><tr><th>商品名称</th></tr></thead>' +
         '<tbody><tr><td>合成商品</td></tr><tr><td>' + item + '</td></tr></tbody></table>';
+    if (mode === 'merged-grid') {
+        info = '<p>供应商：' + vendor + '</p><table><thead><tr><th>商品名称</th><th>金额</th><th>备注</th></tr></thead>' +
+            '<tbody><tr><td>合成商品</td><td colspan="2">合计</td></tr>' +
+            '<tr><td>' + item + '</td><td colspan="2">合计</td></tr></tbody></table>';
+    }
+    if (mode === 'ambiguous-detail-grid') {
+        info = '<table><thead><tr><th>商品名称</th><th>备注</th></tr></thead>' +
+            '<tbody><tr><td colspan="2">合成商品</td></tr></tbody></table>';
+    }
     box.innerHTML = '<h2>单据签收</h2>' + info +
         '<div class="fields"></div><ul class="files"></ul><button class="final" disabled>签收</button>';
     if (mode === 'paginated') box.insertAdjacentHTML('beforeend', '<div class="el-pagination">下一页</div>');
@@ -160,9 +183,28 @@ class ReceiptBrowserTests(unittest.TestCase):
                         self.assertEqual(names, [file.path.name for file in self.plan.files if file.category == label])
                 self.assertIn("签收成功", output.getvalue())
 
+    def test_merged_grid_with_legacy_manifest(self):
+        temp = TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path, _report = synthetic_manifest(temp.name)
+        self.manifest, self.report = load_manifest(path)
+        with redirect_stdout(StringIO()) as output:
+            browser = self.start("merged-grid")
+            self.execute(browser)
+        self.assertIn("清单未记录供应商", output.getvalue())
+        self.assertEqual([event[0] for event in self.events()], ["open", "upload", "finish"])
+        self.assertEqual(self.events()[-1], ["finish", SUPPLIER])
+
+    def test_action_with_supplier_spread_across_columns_stops_scan(self):
+        browser = self.start("ambiguous-grid")
+        with self.assertRaisesRegex(receipt.OrderListStopped, "供应商.*跨列"):
+            browser.scan()
+        self.assertEqual(self.events(), [])
+
     def test_unsafe_detail_stops_before_upload(self):
         for mode, reason in (("wrong-supplier", "供应商.*不一致"), ("unmatched", "无材料商品"),
-                             ("paginated", "完整商品"), ("existing", "已经有附件")):
+                             ("paginated", "完整商品"), ("existing", "已经有附件"),
+                             ("ambiguous-detail-grid", "商品或供应商名称跨列")):
             with self.subTest(mode=mode), redirect_stdout(StringIO()):
                 browser = self.start(mode)
                 with self.assertRaisesRegex(ReceiptStopped, reason):
