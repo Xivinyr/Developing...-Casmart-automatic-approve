@@ -13,25 +13,27 @@ from selenium.webdriver.edge.service import Service
 
 import order_receipt as receipt
 from receipt_materials import ReceiptStopped, build_plan
-from test_order_receipt import ORDER_ID, synthetic_manifest
+from test_order_receipt import PRODUCT, synthetic_manifest
 
 
 FIXTURE = """<!doctype html><meta charset="utf-8">
-<table><thead><tr><th>单据编号</th><th>商品名称</th><th>操作</th></tr></thead>
+<table><thead><tr><th>序号</th><th>商品名称</th><th>操作</th></tr></thead>
 <tbody>
-<tr><td>SYN-123</td><td>合成商品</td><td><button onclick="openReceipt('SYN-123')">签收</button></td></tr>
-<tr><td>SYN-1234</td><td>合成商品</td><td><button onclick="openReceipt('SYN-1234')">签收</button></td></tr>
+<tr><td>1</td><td>合成商品</td><td><button onclick="openReceipt('合成商品')">签收</button></td></tr>
+<tr><td>2</td><td>另一个商品</td><td><button onclick="openReceipt('另一个商品')">签收</button></td></tr>
 </tbody></table>
 <script>
 window.events = [];
 const categories = ['订单截图','支付记录','发票','开箱实物图'];
-function openReceipt(orderId) {
-    events.push(['open', orderId]);
+function openReceipt(product) {
+    events.push(['open', product]);
     const box = document.createElement('div');
     box.className = 'el-dialog';
-    const shown = mode === 'wrong-id' ? 'SYN-1234' : orderId;
-    box.innerHTML = '<h2>单据签收</h2><p>单据编号：' + shown +
-        '</p><div class="fields"></div><ul class="files"></ul><button class="final" disabled>签收</button>';
+    const shown = mode === 'wrong-product' ? '另一个商品' : product;
+    const info = mode === 'split' ? '<table><thead><th>商品名称</th></thead><tbody><tr><td>' + shown +
+        '</td></tr></tbody></table>' : '<p>商品名称：' + shown + '</p>';
+    box.innerHTML = '<h2>单据签收</h2>' + info +
+        '<div class="fields"></div><ul class="files"></ul><button class="final" disabled>签收</button>';
     const list = box.querySelector('.files');
     function addStatus(name, status) {
         const row = document.createElement('li');
@@ -71,7 +73,7 @@ function openReceipt(orderId) {
         box.querySelector('.fields').append(label, input);
     });
     final.onclick = () => {
-        events.push(['finish', orderId]);
+        events.push(['finish', product]);
         box.remove();
         const message = document.createElement('div');
         message.setAttribute('role', 'status');
@@ -111,7 +113,8 @@ class ReceiptBrowserTests(unittest.TestCase):
         temp = TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         path, report = synthetic_manifest(temp.name)
-        self.plan = build_plan(path, report, 1, 2, ORDER_ID)
+        self.manifest, self.report = path, report
+        self.plan = build_plan(path, report, PRODUCT)
 
     def start(self, mode):
         html = "<script>const mode=" + json.dumps(mode) + ";</script>" + FIXTURE
@@ -122,14 +125,19 @@ class ReceiptBrowserTests(unittest.TestCase):
     def events(self):
         return self.driver.execute_script("return window.events")
 
+    def execute(self, browser, consent=lambda *_: True):
+        ready, _skipped = receipt.match_receipts(browser.scan(), self.manifest, self.report)
+        selection = next(pair for pair in ready if pair[1].product == PRODUCT)
+        receipt.run_receipt(browser, *selection, confirm_action=consent)
+
     def test_upload_all_and_confirm_same_order_for_single_and_split_forms(self):
         for mode in ("single", "split"):
             with self.subTest(mode=mode), redirect_stdout(StringIO()) as output:
                 browser = self.start(mode)
-                receipt.run_receipt(browser, self.plan, confirm_action=lambda *_: True)
+                self.execute(browser)
                 events = self.events()
-                self.assertEqual(events[0], ["open", ORDER_ID])
-                self.assertEqual(events[-1], ["finish", ORDER_ID])
+                self.assertEqual(events[0], ["open", PRODUCT])
+                self.assertEqual(events[-1], ["finish", PRODUCT])
                 sent = [item for item in events if item[0] == "upload"]
                 self.assertCountEqual([name for _, _, names in sent for name in names], self.plan.names)
                 if mode == "split":
@@ -138,28 +146,28 @@ class ReceiptBrowserTests(unittest.TestCase):
                         self.assertEqual(names, [file.path.name for file in self.plan.files if file.category == label])
                 self.assertIn("签收成功", output.getvalue())
 
-    def test_wrong_id_or_existing_attachments_stop_before_upload(self):
-        for mode, reason in (("wrong-id", "不一致"), ("existing", "已经有附件")):
+    def test_wrong_product_or_existing_attachments_stop_before_upload(self):
+        for mode, reason in (("wrong-product", "不一致"), ("existing", "已经有附件")):
             with self.subTest(mode=mode), redirect_stdout(StringIO()):
                 browser = self.start(mode)
                 with self.assertRaisesRegex(ReceiptStopped, reason):
-                    receipt.run_receipt(browser, self.plan, confirm_action=lambda *_: True)
-                self.assertEqual(self.events(), [["open", ORDER_ID]])
+                    self.execute(browser)
+                self.assertEqual(self.events(), [["open", PRODUCT]])
 
     def test_upload_error_does_not_reach_final_confirmation(self):
         browser = self.start("failed")
         consent = Mock(return_value=True)
         with redirect_stdout(StringIO()):
             with self.assertRaisesRegex(ReceiptStopped, "上传失败"):
-                receipt.run_receipt(browser, self.plan, confirm_action=consent)
-        consent.assert_called_once_with("上传", ORDER_ID)
+                self.execute(browser, consent=consent)
+        consent.assert_called_once_with("上传", PRODUCT)
         self.assertEqual([event[0] for event in self.events()], ["open", "upload"])
 
     def test_ambiguous_completion_causes_no_retry(self):
         browser = self.start("uncertain")
         with redirect_stdout(StringIO()):
             with self.assertRaisesRegex(ReceiptStopped, "未看到明确"):
-                receipt.run_receipt(browser, self.plan, confirm_action=lambda *_: True)
+                self.execute(browser)
         self.assertEqual([event[0] for event in self.events()], ["open", "upload", "finish"])
 
 

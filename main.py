@@ -87,8 +87,8 @@ class TaskMenu:
         approval = ttk.LabelFrame(body, text="Casmart 采购单据", padding=(12, 6))
         approval.grid(sticky="ew")
         self.add_task(approval, "自动送审", "完成学校认证后，按原流程送审线下采购单据。", self.submit)
-        self.add_task(approval, "采购单据签收", "选分类清单和指定单号，核对附件上传结果后签收。", self.receive_order)
-        self.add_task(approval, "删除错误导入订单", "填写明确单号，预览范围并二次确认后逐条删除。", self.delete_orders)
+        self.add_task(approval, "采购单据签收", "选择分类批次，按商品名匹配文件夹和材料。", self.receive_order)
+        self.add_task(approval, "自动删除", "预览筛选范围，逐条处理有可用删除按钮的单据。", self.delete_orders)
         self.add_task(approval, "仅验证登录", "登录并进入单据列表，适合检查学校认证。", self.login_only)
 
         attachments = ttk.LabelFrame(body, text="腾讯文档附件", padding=(12, 6))
@@ -129,7 +129,7 @@ class TaskMenu:
     def delete_orders(self):
         # 删除是独立任务，不能由送审或附件分类流程自动触发。
         self.start([sys.executable, str(PROJECT / "order_delete.py"), "--execute", "--wait-on-exit"],
-                   "删除错误导入订单", console=True)
+                   "自动删除", console=True)
 
     def local_xlsx(self):
         filename = filedialog.askopenfilename(parent=self.root, title="选择导出的报账表格", filetypes=[("Excel 表格", "*.xlsx")])

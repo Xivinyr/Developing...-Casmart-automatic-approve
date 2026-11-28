@@ -6,15 +6,13 @@ body {font:16px sans-serif} td,th {border:1px solid #aaa;padding:6px}
 .el-loading-mask {position:fixed;inset:0;background:#eee} iframe {width:700px;height:300px}
 </style>
 <label>筛选<input id="filter" value=""></label><label><input id="status" type="checkbox">仅测试</label>
-<table><thead><tr><th id="id-header">单据编号</th><th>商品</th><th>操作</th></tr></thead><tbody></tbody></table>
+<table><thead><tr><th>序号</th><th>商品</th><th>操作</th></tr></thead><tbody></tbody></table>
 <div class="el-pagination"><button class="btn-prev">上一页</button>
 <ul class="el-pager"><li class="active"></li></ul><button class="btn-next">下一页</button></div>
 <script>
 const params=new URLSearchParams(location.search), mode=params.get('mode')||'normal';
 let rows=['GOOD-001','ERR-002','ERR-003','SENT-004','GOOD-005'];
-if(mode==='duplicate') rows.push('ERR-002');
-if(mode==='unknown-header') document.querySelector('#id-header').textContent='商品名';
-if(mode==='two-id-columns') document.querySelector('th:nth-child(2)').textContent='订单号';
+if(mode==='duplicate') rows=['ERR-001','ERR-002','ERR-003','ERR-004'];
 if(mode==='virtual-list') document.querySelector('table').setAttribute('data-virtualized','true');
 if(mode==='unknown-pager') document.querySelector('.el-pagination').className='custom-pages';
 if(mode==='split-table') {
@@ -30,9 +28,10 @@ let current=2, size=2;window.pending=null;
 window.events=[];window.deletions=[];window.submits=0;
 function render(){
   current=Math.min(current,Math.max(1,Math.ceil(rows.length/size)));
-  document.querySelector('tbody').innerHTML=rows.slice((current-1)*size,current*size).map(id=>
-    `<tr><td><a>${id}</a></td><td>合成商品 ${id}</td><td><button onclick="submits++">送审</button>`+
-    (id.startsWith('SENT')?'':`<button class="delete" data-id="${id}"><span>删除</span></button>`)+
+  document.querySelector('tbody').innerHTML=rows.slice((current-1)*size,current*size).map((id,i)=>
+    `<tr><td>${i + 1}</td><td>${mode==='duplicate' ? '合成同名商品' : '合成商品 ' + id}</td><td><button onclick="submits++">送审</button>`+
+    (id.startsWith('ERR')?`<button class="delete" data-id="${id}"><span>删除</span></button>`:
+      id.startsWith('SENT')?'<button disabled>删除</button>':'')+
     '</td></tr>').join('');
   document.querySelector('.active').textContent=current;
   document.querySelector('.btn-prev').disabled=current===1;
@@ -61,12 +60,12 @@ function finishDelete(id){
 }
 function openDelete(id){
   events.push('open:'+id);pending=id;
-  if(mode==='native') {if(confirm('确认删除订单号：'+id+'？'))finishDelete(id);return;}
+  if(mode==='native') {if(confirm('确认删除这条单据？'))finishDelete(id);return;}
   if(mode==='no-dialog')return;
   if(mode==='confirm-frame') {
     document.body.insertAdjacentHTML('beforeend','<div class="el-dialog"><iframe src="/confirm"></iframe></div>');return;
   }
-  let text=mode==='wrong-dialog'?'确认送审？':mode==='wrong-id'?'确认删除订单号：GOOD-001？':'确认删除订单号：'+id+'？';
+  let text=mode==='wrong-dialog'?'确认送审？':'确认删除这条单据？';
   document.body.insertAdjacentHTML('beforeend',`<div class="el-message-box"><div>${text}</div>
     <button class="cancel">取消</button><button class="confirm"><span>确定</span></button></div>`);
   document.querySelector('.cancel').onclick=()=>document.querySelector('.el-message-box').remove();

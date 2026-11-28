@@ -1,9 +1,10 @@
-"""按本人选定的单据和附件清单签收。默认仅作本地预检。"""
+"""按网页商品名匹配分类文件夹，默认仅作本地预检。"""
 import argparse
+from collections import Counter
 import re
 import sys
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog
 from urllib.parse import urlsplit
 
 from selenium.common.exceptions import NoSuchFrameException, StaleElementReferenceException, TimeoutException
@@ -11,20 +12,17 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
 import songshen as shared
-from order_delete import ID_COLUMNS, OrderListBrowser, OrderListStopped, PROJECT
-from receipt_materials import REQUIRED, ReceiptStopped, accepts_file, build_plan, load_manifest
+from order_list import OrderListBrowser, OrderListStopped, PRODUCT_COLUMNS, PROJECT, product_key
+from receipt_materials import REQUIRED, ReceiptStopped, accepts_file, build_plan, catalog, load_manifest
 
 
 ROW_LABELS = frozenset({"签收", "签收单据", "订单签收"})
 FINAL_LABELS = ("签收", "确认签收", "提交签收")
 UPLOAD_WAIT = 90
-ID_LINE = re.compile(r"(?:^|\n)\s*(?:线下)?(" + "|".join(ID_COLUMNS)
-                     + r")\s*[:：]?\s*([A-Za-z0-9][A-Za-z0-9._/-]*)(?![A-Za-z0-9._/-])")
-ID_EQUIVALENTS = ({"单据编号", "单据号"}, {"订单编号", "订单号"}, {"采购单号", "采购单据编号"})
 
 # 仅从有明确签收操作的可见表单读取上传状态。file input 本身可以由上传组件隐藏。
 READ_RECEIPT_FORM = r"""
-const [labels, fullPage] = arguments;
+const [labels, fullPage, productLabels] = arguments;
 const visible = e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
 const buttonSelector = 'button,a,[role="button"],.el-button,.ant-btn,.layui-btn,[onclick]';
 const dialogSelector = 'dialog,[role="dialog"],.el-dialog,.ant-modal,.layui-layer-dialog,.layui-layer-page';
@@ -56,18 +54,35 @@ for (const root of roots) {
             // 表单显式指向站外时，不把材料交给该控件。
             targetOK: !input.form || new URL(input.form.action, location.href).origin === location.origin};
     });
-    forms.push({root, text: root.innerText, buttons, inputs, files});
+    const isProduct = label => productLabels.includes(label.replace(/[\s：:]/g, ''));
+    const products = [];
+    for (const table of root.querySelectorAll('table')) {
+        const columns = [...table.querySelectorAll('thead th')].map(e => isProduct(e.innerText));
+        for (const row of table.querySelectorAll('tbody tr')) {
+            const cells = [...row.cells];
+            if (cells.length === columns.length)
+                cells.forEach((cell, index) => { if (columns[index]) products.push(cell.innerText); });
+        }
+    }
+    for (const label of root.querySelectorAll('label')) {
+        if (isProduct(label.innerText) && label.control?.type === 'text' && visible(label.control))
+            products.push(label.control.value);
+    }
+    forms.push({root, text: root.innerText, products, buttons, inputs, files});
 }
 return forms;
 """
 
 
-def identity_from_form(text, column, order_id):
-    labels = next((group for group in ID_EQUIVALENTS if column in group), {column})
-    matches = {value for label, value in ID_LINE.findall(text) if label in labels}
-    if matches and matches != {order_id}:
-        raise ReceiptStopped("签收表单上的单号与已核对的单据不一致。")
-    return matches == {order_id}
+def product_from_form(form, product, labels=PRODUCT_COLUMNS):
+    pattern = r"(?:^|\n)[ \t]*(?:" + "|".join(map(re.escape, sorted(labels, key=len, reverse=True)))
+    pattern += r")[ \t]*(?:[:：][ \t]*|\n[ \t]*|\t)([^\n\t]+)"
+    values = form["products"] or re.findall(pattern, form["text"])
+    matches = {product_key(value) for value in values if value.strip()}
+    expected = {product_key(product)}
+    if matches and matches != expected:
+        raise ReceiptStopped("签收表单上的商品名称与已核对的商品不一致。")
+    return matches == expected
 
 
 def uploads_complete(rows, names):
@@ -101,30 +116,23 @@ def upload_groups(slots, files):
 
 
 class ReceiptBrowser(OrderListBrowser):
-    """复用列表、分页与单次点击机制。签收页只操作已核对单号的表单。"""
+    """复用列表和分页，只处理名称能唯一对应的商品。"""
     row_labels = ROW_LABELS
     operation = "签收"
+    require_product = True
 
-    def __init__(self, driver, id_column=None, timeout=shared.WAIT_TIME):
-        super().__init__(driver, id_column, timeout)
-        self.receipt_column = None
+    def __init__(self, driver, product_column=None, timeout=shared.WAIT_TIME):
+        super().__init__(driver, product_column, timeout)
         self.open_url = None
 
-    def find_order(self, plan, previous=None):
-        matches = self.scan([plan.order_id])[plan.order_id]
+    def find_product(self, product, previous):
+        matches = [order for order in self.scan() if product_key(order.product) == product_key(product)]
         if len(matches) != 1:
-            reason = "匹配多条" if matches else "未找到"
-            raise ReceiptStopped(f"当前筛选范围内{reason}该单号，请核对条件和单号。")
+            raise ReceiptStopped("当前筛选范围内未能唯一找到该商品，请重新核对。")
         order = matches[0]
         if not order.actionable:
             raise ReceiptStopped("该单据没有可用的签收按钮，可能已签收或状态不符。")
-        products = [value for label, value in zip(order.columns, order.cells)
-                    if label in {"商品", "商品名称", "采购商品", "品名"} and value.strip()]
-        product = shared.compact_text(plan.product)
-        if (len(products) == 1 and product not in {"", "未识别商品"}
-                and shared.compact_text(products[0]) != product):
-            raise ReceiptStopped("清单商品与网页商品名称不同，请核对单据和分类记录。")
-        if previous is not None and order.fingerprint != previous.fingerprint:
+        if order.fingerprint != previous.fingerprint:
             raise ReceiptStopped("单据内容在预览后已变化，请重新核对。")
         return order
 
@@ -140,20 +148,21 @@ class ReceiptBrowser(OrderListBrowser):
                 or url.port not in (None, 443) or url.username is not None):
             raise ReceiptStopped("已离开 Casmart 会员中心，停止签收。")
 
-    def read_form(self, order_id):
+    def read_form(self, product):
         self.guard_receipt()
         forms = []
+        labels = PRODUCT_COLUMNS | ({self.product_column} if self.product_column else set())
         for path in self.contexts():
             # 完整页面只有在行按钮引起页面跳转后才允许作为签收区域。
             full_page = self.driver.execute_script("return location.href") != self.open_url
-            for form in self.driver.execute_script(READ_RECEIPT_FORM, FINAL_LABELS, full_page):
+            for form in self.driver.execute_script(READ_RECEIPT_FORM, FINAL_LABELS, full_page, sorted(labels)):
                 forms.append((path, form))
         if len(forms) > 1:
             raise ReceiptStopped("页面上有多个可能的签收表单，无法唯一定位。")
         if not forms:
             return None
         path, form = forms[0]
-        if not identity_from_form(form["text"], self.receipt_column, order_id):
+        if not product_from_form(form, product, labels):
             return None
         if len(form["buttons"]) != 1:
             raise ReceiptStopped("签收表单的最终签收按钮不唯一，请先核对页面。")
@@ -174,14 +183,13 @@ class ReceiptBrowser(OrderListBrowser):
             raise ReceiptStopped(reason) from exc
 
     def open_receipt(self, order):
-        button = self.row_action(order)
-        self.receipt_column = self.id_column or next(column for column in order.columns if column in ID_COLUMNS)
+        button, _page = self.row_action(order)
         self.open_url = self.driver.execute_script("return location.href")
         self.click_once(button)
 
     def upload(self, plan):
-        _path, form = self.wait(lambda: self.read_form(plan.order_id),
-            "未找到带相同单号的签收表单，尚未上传。需要先核对实际网页。")
+        _path, form = self.wait(lambda: self.read_form(plan.product),
+            "未能在签收表单核对同名商品，尚未上传。需要先核对实际网页。")
         if form["files"] or any(slot["selected"] for slot in form["inputs"]):
             raise ReceiptStopped("签收表单已经有附件，请先在网页核对，避免重复上传。")
         groups = upload_groups(form["inputs"], plan.files)
@@ -191,8 +199,8 @@ class ReceiptBrowser(OrderListBrowser):
             file.verify()
         sent = ()
         for index, (original, files) in enumerate(groups):
-            # 上传一组后页面可能重绘，下一组使用相同单号下重新读取的控件。
-            state = self.read_form(plan.order_id)
+            # 上传一组后页面可能重绘，下一组重新核对商品及控件。
+            state = self.read_form(plan.product)
             if not state:
                 raise ReceiptStopped("上传前签收页面发生变化。")
             current = upload_groups(state[1]["inputs"], plan.files)
@@ -210,7 +218,7 @@ class ReceiptBrowser(OrderListBrowser):
                 "未能逐个确认附件上传成功，请检查网页。程序尚未点击最终签收。", timeout=UPLOAD_WAIT)
 
     def verified_upload(self, plan, names=None):
-        state = self.read_form(plan.order_id)
+        state = self.read_form(plan.product)
         if state is None:
             return False
         _path, form = state
@@ -247,122 +255,110 @@ class ReceiptBrowser(OrderListBrowser):
         self.wait(completed, "未看到明确的签收成功提示。可能已受理，请人工核对单据状态，勿直接重试。")
 
 
-class ReceiptSelection(simpledialog.Dialog):
-    def __init__(self, parent, records):
-        self.records = records
-        super().__init__(parent, title="选择签收附件和单号")
-
-    def body(self, parent):
-        ttk.Label(parent, text="选择一条分类记录，并填写对应 Casmart 完整单号。").grid(sticky="w", pady=(4, 12))
-        values = [f"表 {r.get('sheet_index')} · 起始行 {r.get('row')} · {str(r.get('product', ''))[:64]}"
-                  for r in self.records]
-        self.record = ttk.Combobox(parent, values=values, state="readonly", width=62)
-        self.record.grid(sticky="ew")
-        ttk.Label(parent, text="Casmart 单号").grid(sticky="w", pady=(10, 3))
-        self.number = ttk.Entry(parent, width=28)
-        self.number.grid(sticky="w")
-        ttk.Label(parent, text="用于匹配的列表列").grid(sticky="w", pady=(10, 3))
-        self.column = ttk.Combobox(parent, values=("自动识别唯一编号列", *ID_COLUMNS), state="readonly", width=25)
-        self.column.current(0)
-        self.column.grid(sticky="w")
-        return self.record
-
-    def validate(self):
-        index = self.record.current()
-        if index < 0 or not self.number.get().strip():
-            messagebox.showwarning("缺少信息", "请明确选择一条记录并填写完整单号。", parent=self)
-            return False
-        record = self.records[index]
-        self.result = (record.get("sheet_index"), record.get("row"), self.number.get(), self.column.get()
-                       if self.column.current() > 0 else None)
-        return True
-
-
-def choose_plan():
+def choose_source():
     root = tk.Tk()
     root.withdraw()
     try:
-        file = filedialog.askopenfilename(parent=root, title="选择附件分类输出的 manifest.json",
-            initialdir=PROJECT / "outputs", filetypes=[("附件分类清单", "manifest.json"), ("JSON 文件", "*.json")])
-        if not file:
-            return None
-        manifest, report = load_manifest(file)
-        selected = ReceiptSelection(root, report["records"]).result
-        if selected is None:
-            return None
-        sheet, row, order_id, column = selected
-        return build_plan(manifest, report, sheet, row, order_id), column
+        return filedialog.askdirectory(parent=root, title="选择包含 manifest.json 的分类批次文件夹",
+                                       initialdir=PROJECT / "outputs", mustexist=True)
     finally:
         root.destroy()
 
 
+def match_receipts(rows, manifest, report):
+    groups = catalog(report)
+    counts = Counter(product_key(row.product) for row in rows)
+    ready, skipped = [], []
+    for row in rows:
+        if not row.actionable:
+            continue
+        name = product_key(row.product)
+        if not name:
+            skipped.append((row, "网页没有可读的商品名称"))
+        elif counts[name] != 1:
+            skipped.append((row, "当前筛选范围内有同名商品"))
+        else:
+            try:
+                ready.append((row, build_plan(manifest, report, row.product, groups)))
+            except ReceiptStopped as exc:
+                skipped.append((row, str(exc)))
+    return ready, skipped
+
+
 def show_plan(plan):
-    print(f"\n签收预检 | Casmart 单号 {plan.order_id}")
-    print(f"分类记录：表 {plan.sheet}，起始行 {plan.row}，商品 {plan.product or '未填写'}")
+    print(f"\n商品：{plan.product}。文件夹：{plan.folder.name}")
     if plan.warnings:
-        print(f"分类批次另有 {plan.warnings} 条格式警告，请查阅原清单。")
-    print(f"待上传 {len(plan.files)} 个文件：")
+        print(f"分类批次有 {plan.warnings} 条格式警告，请查阅原清单。")
     for file in plan.files:
         print(f"  {file.category}  {file.path.name}  ({file.size} 字节)")
 
 
-def confirm(action, order_id):
-    phrase = f"{action} {order_id}"
+def confirm(action, product):
     try:
-        return input(f"核对后输入“{phrase}”继续，直接回车取消：").strip() == phrase
+        return input(f"核对「{product}」后输入“{action}”继续，直接回车取消：").strip() == action
     except EOFError:
         return False
 
 
-def run_receipt(browser, plan, *, check_only=False, confirm_action=confirm):
-    order = browser.find_order(plan)
-    print(f"已在当前筛选的第 {order.page} 页找到唯一单据：")
-    for column, value in zip(order.columns, order.cells):
+def choose_match(ready):
+    if len(ready) == 1:
+        return ready[0]
+    try:
+        answer = input("选择本次要签收的商品序号，直接回车取消：").strip()
+        choice = int(answer)
+    except (EOFError, ValueError):
+        return None
+    return ready[choice - 1] if 1 <= choice <= len(ready) else None
+
+
+def run_receipt(browser, order, plan, *, confirm_action=confirm):
+    show_plan(plan)
+    print(f"网页匹配位置：第 {order.page} 页第 {order.position} 行。")
+    for column, value in order.details:
         print(f"  {column}：{value}")
-    if check_only or not confirm_action("上传", plan.order_id):
-        print("本次仅核对单据，未上传或签收。")
+    if not confirm_action("上传", plan.product):
+        print("已取消上传。")
         return
-    fresh = browser.find_order(plan, previous=order)
+    fresh = browser.find_product(plan.product, previous=order)
     browser.open_receipt(fresh)
     browser.upload(plan)
     print(f"页面已确认 {len(plan.files)} 个文件都上传成功。请在浏览器核对附件后确认签收。")
-    if not confirm_action("签收", plan.order_id):
+    if not confirm_action("签收", plan.product):
         print("最终签收已取消。附件可能已暂存，请在网页核对。")
         return
     browser.finish(plan)
-    print(f"单据 {plan.order_id} 签收成功，已看到明确的网页提示。")
+    print(f"商品「{plan.product}」签收成功，已看到明确的网页提示。")
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="按明确单号上传已分类附件并签收，默认本地预检")
-    parser.add_argument("--manifest", type=str, help="由附件分类任务生成的 manifest.json")
-    parser.add_argument("--sheet-index", type=int, help="清单中的工作表序号，从 1 开始")
-    parser.add_argument("--row", type=int, help="清单中的记录起始行")
-    parser.add_argument("--order-id", help="完整 Casmart 单号")
-    parser.add_argument("--id-column", choices=ID_COLUMNS, help="列表的编号列，若不确定则自动识别唯一列")
+    parser = argparse.ArgumentParser(description="按商品名匹配分类文件夹，默认只检查本地材料")
+    parser.add_argument("--folder", "--manifest", dest="source", help="分类批次文件夹或其中的 manifest.json")
+    parser.add_argument("--product-column", help="网页商品名称列，默认识别常用商品表头")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--check-list", action="store_true", help="登录并只读核对编号")
-    mode.add_argument("--execute", action="store_true", help="进入页面并在本人两次确认后上传与签收")
+    mode.add_argument("--check-list", action="store_true", help="登录，只读核对商品和文件夹匹配")
+    mode.add_argument("--execute", action="store_true", help="选择匹配商品并确认上传和签收")
     parser.add_argument("--via-casmart", action="store_true", help="从商城入口登录")
     parser.add_argument("--wait-on-exit", action="store_true", help="保留任务窗口，回车关闭")
     args = parser.parse_args(argv)
     try:
-        provided = (args.manifest, args.sheet_index, args.row, args.order_id)
-        if all(value is None for value in provided):
-            selection = choose_plan()
-            if selection is None:
-                return 0
-            plan, column = selection
-        else:
-            if any(value is None for value in provided):
-                raise ReceiptStopped("请同时指定 --manifest、--sheet-index、--row 和 --order-id。")
-            manifest, report = load_manifest(args.manifest)
-            plan = build_plan(manifest, report, args.sheet_index, args.row, args.order_id)
-            column = None
-        show_plan(plan)
-        if not (args.check_list or args.execute):
-            print("本地预检通过。")
+        source = args.source if args.source is not None else choose_source()
+        if not source:
             return 0
+        manifest, report = load_manifest(source)
+        groups = catalog(report)
+        if not groups:
+            raise ReceiptStopped("分类批次没有可按名称匹配的商品。")
+        if not (args.check_list or args.execute):
+            checked = 0
+            for name in groups:
+                try:
+                    show_plan(build_plan(manifest, report, name, groups))
+                    checked += 1
+                except ReceiptStopped as exc:
+                    print(f"[跳过] {name}：{exc}")
+            print(f"本地预检完成，共 {checked} 个商品的材料通过。")
+            return 0 if checked else 2
+
         start = shared.TARGET_URL if args.via_casmart else shared.load_school_login_url()
         accounts = shared.ask_credentials(login_only=True, direct=not args.via_casmart)
         if accounts is None:
@@ -371,7 +367,18 @@ def main(argv=None):
         driver.get(start)
         if not shared.auto_login_if_needed(driver, accounts) or not shared.ensure_target_page(driver):
             raise ReceiptStopped("未完成登录或进入采购单据列表。")
-        run_receipt(ReceiptBrowser(driver, args.id_column or column), plan, check_only=args.check_list)
+        browser = ReceiptBrowser(driver, args.product_column)
+        print("正在只读核对当前筛选中的商品和分类文件夹。")
+        ready, skipped = match_receipts(browser.scan(), manifest, report)
+        for row, reason in skipped:
+            print(f"[跳过] 第 {row.page} 页第 {row.position} 行 {row.product}：{reason}")
+        for index, (row, plan) in enumerate(ready, 1):
+            print(f"{index}. {row.product} → {plan.folder.name}（{len(plan.files)} 个附件）")
+        print(f"唯一匹配且文件通过预检 {len(ready)} 条，待人工核对 {len(skipped)} 条。")
+        if args.execute and ready:
+            selection = choose_match(ready)
+            if selection:
+                run_receipt(browser, *selection)
         return 0
     except (ReceiptStopped, OrderListStopped) as exc:
         print(f"签收任务停止：{exc}")

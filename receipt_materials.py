@@ -1,12 +1,12 @@
-"""将一条已分类的附件记录和用户指定的 Casmart 单号绑定。"""
+"""按商品名和分类文件夹核对签收材料。"""
 from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
 
-from attachments.core import DEFAULT, extension
-from order_delete import ID_PATTERN
+from attachments.core import DEFAULT, extension, safe
+from order_list import product_key
 
 
 REQUIRED = tuple(DEFAULT["required"])
@@ -43,12 +43,8 @@ class Attachment:
 
 @dataclass(frozen=True)
 class ReceiptPlan:
-    manifest: Path
-    sheet: int
-    row: int
-    rows: tuple
+    folder: Path
     product: str
-    order_id: str
     files: tuple
     warnings: int
 
@@ -67,6 +63,11 @@ def local_path(path):
 def load_manifest(path):
     try:
         path = local_path(path)
+        if path.is_dir():
+            folder = path
+            path = local_path(folder / "manifest.json")
+            if path.parent != folder:
+                raise ValueError
         if path.name != "manifest.json" or not path.is_file():
             raise ValueError
         data = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -82,7 +83,7 @@ def load_manifest(path):
     return path, data
 
 
-def manifest_file(root, item, sheet, row):
+def manifest_file(root, item, sheet, folder_name):
     """只接受本次分类目录下的清单路径，校验实际文件格式、大小和哈希。"""
     try:
         ref, category, digest, size = (item[key] for key in ("path", "category", "sha256", "bytes"))
@@ -91,45 +92,63 @@ def manifest_file(root, item, sheet, row):
         relative = PurePosixPath(ref.replace("\\", "/"))
         if (relative.is_absolute() or ".." in relative.parts or len(relative.parts) < 3
                 or not relative.parts[0].startswith(f"{sheet:02d}-")
-                or not relative.parts[1].startswith(f"row-{row:06d}-")):
+                or relative.parts[1] != folder_name):
             raise ValueError
         path = local_path(root / Path(*relative.parts))
-        if (not path.is_relative_to(root) or not path.is_file() or path.suffix.lower() not in MIME
+        folder = root / relative.parts[0] / folder_name
+        if (not path.is_relative_to(folder) or not path.is_file() or path.suffix.lower() not in MIME
                 or category not in REQUIRED or type(size) is not int or size <= 0):
             raise ValueError
     except (OSError, KeyError, TypeError, ValueError) as exc:
         raise ReceiptStopped("清单中有无法用于签收的附件路径或分类。") from exc
     attachment = Attachment(category, path, digest, size)
     attachment.verify()
-    return attachment
+    return attachment, folder
 
 
-def build_plan(manifest, report, sheet, row, order_id):
-    order_id = order_id.strip()
-    if not ID_PATTERN.fullmatch(order_id):
-        raise ReceiptStopped("请输入完整 Casmart 单号。编号须为 2–100 位字母、数字或 . _ / -。")
-    if type(sheet) is not int or sheet < 1 or type(row) is not int or row < 1:
-        raise ReceiptStopped("请选择一个明确的工作表和记录起始行。")
-    selected = [r for r in report["records"] if (r.get("sheet_index"), r.get("row")) == (sheet, row)]
+def catalog(report):
+    """同名记录即使附件尚未补齐，也参与重名判断。"""
+    groups = {}
+    for record in report["records"]:
+        name = record.get("product")
+        key = product_key(name) if isinstance(name, str) else ""
+        if key and key != "未识别商品":
+            groups.setdefault(key, []).append(record)
+    return groups
+
+
+def build_plan(manifest, report, product, groups=None):
+    groups = catalog(report) if groups is None else groups
+    selected = groups.get(product_key(product), ())
+    if not selected:
+        raise ReceiptStopped("分类批次没有同名商品文件夹。")
     if len(selected) != 1:
-        raise ReceiptStopped("无法按表序号和起始行唯一找到分类记录。")
+        raise ReceiptStopped("分类批次有同名商品文件夹，请先核对。")
     record = selected[0]
-    rows, product, entries = record.get("rows"), record.get("product"), record.get("files")
+    sheet, row = record.get("sheet_index"), record.get("row")
+    rows, name, entries = record.get("rows"), record["product"], record.get("files")
+    if type(sheet) is not int or sheet < 1 or type(row) is not int or row < 1:
+        raise ReceiptStopped("商品文件夹缺少有效的分类来源。")
     if (not isinstance(rows, list) or not rows or not all(type(r) is int and r > 0 for r in rows)
-            or not isinstance(product, str) or not isinstance(entries, list) or not entries):
+            or not isinstance(entries, list) or not entries):
         raise ReceiptStopped("分类记录不完整，无法核对签收附件。")
     if record.get("missing"):
         raise ReceiptStopped("该记录有缺失附件，请先在附件分类任务补齐后选择新的清单。")
     if any(isinstance(error, dict) and error.get("sheet_index") == sheet
            and error.get("row") in {*rows, row} for error in report.get("errors", [])):
         raise ReceiptStopped("该记录有附件下载或分类错误，请先处理错误。")
-    files = tuple(manifest_file(manifest.parent, entry, sheet, row) for entry in entries)
+    # 记录的商品名、实际记录目录名和附件路径必须指向同一商品。
+    folder_name = f"row-{row:06d}-{safe(name)}"
+    located = [manifest_file(manifest.parent, entry, sheet, folder_name) for entry in entries]
+    folders = {folder for _, folder in located}
+    if len(folders) != 1:
+        raise ReceiptStopped("该商品的附件分属多个文件夹，需重新核对分类批次。")
+    files = tuple(file for file, _ in located)
     if missing := set(REQUIRED).difference(file.category for file in files):
         raise ReceiptStopped("该记录缺少签收所需附件：" + "、".join(sorted(missing)) + "。")
     if len({file.path.name.casefold() for file in files}) != len(files):
         raise ReceiptStopped("待上传文件重名，无法逐个核对上传结果。")
-    return ReceiptPlan(manifest, sheet, row, tuple(rows), product, order_id, files,
-                       len(report.get("warnings", [])))
+    return ReceiptPlan(folders.pop(), name, files, len(report.get("warnings", [])))
 
 
 def accepts_file(accept, attachment):
